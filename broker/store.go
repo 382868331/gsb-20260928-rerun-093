@@ -7,18 +7,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // 磁盘布局：
 //   <dir>/topics/<topic>.jsonl   消息日志（追加写）
-//   <dir>/subs.json              订阅与已确认偏移（原子重写）
+//   <dir>/subs.json              订阅、已确认偏移、退避与隔离状态（原子重写）
 //   <dir>/acks.jsonl             确认去向记录（追加写）
+//   <dir>/history.jsonl          消息历史：每次领取/超时/拒绝/确认/隔离/人工重投（追加写）
 
 type subDisk struct {
-	Name     string  `json:"name"`
-	Topic    string  `json:"topic"`
-	Acked    []int64 `json:"acked"`
-	EpochSeq uint64  `json:"epoch_seq"`
+	Name        string              `json:"name"`
+	Topic       string              `json:"topic"`
+	Acked       []int64             `json:"acked"`
+	EpochSeq    uint64              `json:"epoch_seq"`
+	Failures    map[int64]int       `json:"failures,omitempty"`
+	RetryAt     map[int64]time.Time `json:"retry_at,omitempty"`
+	Quarantined []int64             `json:"quarantined,omitempty"`
+	MaxFailures int                 `json:"max_failures,omitempty"`
+	BackoffBase time.Duration       `json:"backoff_base,omitempty"`
 }
 
 type stateDisk struct {
@@ -79,14 +86,34 @@ func (b *Broker) load() error {
 		}
 		for _, s := range sd.Subs {
 			st := &subState{
-				name:     s.Name,
-				topic:    s.Topic,
-				acked:    map[int64]bool{},
-				inFlight: map[int64]*inFlight{},
-				epochSeq: s.EpochSeq,
+				name:        s.Name,
+				topic:       s.Topic,
+				acked:       map[int64]bool{},
+				inFlight:    map[int64]*inFlight{},
+				epochSeq:    s.EpochSeq,
+				failures:    map[int64]int{},
+				retryAt:     map[int64]time.Time{},
+				quarantined: map[int64]bool{},
+				maxFailures: s.MaxFailures,
+				backoffBase: s.BackoffBase,
+			}
+			if st.maxFailures < 1 {
+				st.maxFailures = defaultMaxFailures
+			}
+			if st.backoffBase <= 0 {
+				st.backoffBase = defaultBackoffBase
 			}
 			for _, off := range s.Acked {
 				st.acked[off] = true
+			}
+			for off, n := range s.Failures {
+				st.failures[off] = n
+			}
+			for off, t := range s.RetryAt {
+				st.retryAt[off] = t
+			}
+			for _, off := range s.Quarantined {
+				st.quarantined[off] = true
 			}
 			b.subs[s.Topic+"/"+s.Name] = st
 		}
@@ -110,6 +137,30 @@ func (b *Broker) load() error {
 				return fmt.Errorf("load acks: %w", err)
 			}
 			b.acks = append(b.acks, r)
+		}
+		if err := sc.Err(); err != nil {
+			return err
+		}
+	}
+	// 消息历史
+	hf, err := os.Open(filepath.Join(b.dir, "history.jsonl"))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil {
+		defer hf.Close()
+		sc := bufio.NewScanner(hf)
+		sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			var e HistoryEvent
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				return fmt.Errorf("load history: %w", err)
+			}
+			b.history = append(b.history, e)
 		}
 		if err := sc.Err(); err != nil {
 			return err
@@ -150,13 +201,40 @@ func (b *Broker) appendAckLocked(r AckRecord) error {
 	return f.Sync()
 }
 
+func (b *Broker) appendHistoryLocked(e HistoryEvent) error {
+	f, err := os.OpenFile(filepath.Join(b.dir, "history.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	data, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
 // flushLocked 原子重写订阅状态文件。调用方须持有锁。
 func (b *Broker) flushLocked() error {
 	sd := stateDisk{}
 	for _, s := range b.subs {
-		d := subDisk{Name: s.name, Topic: s.topic, EpochSeq: s.epochSeq}
+		d := subDisk{
+			Name:        s.name,
+			Topic:       s.topic,
+			EpochSeq:    s.epochSeq,
+			Failures:    s.failures,
+			RetryAt:     s.retryAt,
+			MaxFailures: s.maxFailures,
+			BackoffBase: s.backoffBase,
+		}
 		for off := range s.acked {
 			d.Acked = append(d.Acked, off)
+		}
+		for off := range s.quarantined {
+			d.Quarantined = append(d.Quarantined, off)
 		}
 		sd.Subs = append(sd.Subs, d)
 	}
