@@ -12,7 +12,7 @@ import (
 
 // 磁盘布局：
 //   <dir>/topics/<topic>.jsonl   消息日志（追加写）
-//   <dir>/subs.json              订阅、已确认偏移、退避与隔离状态（原子重写）
+//   <dir>/subs.json              订阅、已确认偏移、退避、隔离与放弃状态（原子重写）
 //   <dir>/acks.jsonl             确认去向记录（追加写）
 //   <dir>/history.jsonl          消息历史：每次领取/超时/拒绝/确认/隔离/人工重投（追加写）
 
@@ -24,6 +24,7 @@ type subDisk struct {
 	Failures    map[int64]int       `json:"failures,omitempty"`
 	RetryAt     map[int64]time.Time `json:"retry_at,omitempty"`
 	Quarantined []int64             `json:"quarantined,omitempty"`
+	Abandoned   []int64             `json:"abandoned,omitempty"`
 	MaxFailures int                 `json:"max_failures,omitempty"`
 	BackoffBase time.Duration       `json:"backoff_base,omitempty"`
 }
@@ -94,6 +95,7 @@ func (b *Broker) load() error {
 				failures:    map[int64]int{},
 				retryAt:     map[int64]time.Time{},
 				quarantined: map[int64]bool{},
+				abandoned:   map[int64]bool{},
 				maxFailures: s.MaxFailures,
 				backoffBase: s.BackoffBase,
 			}
@@ -114,6 +116,9 @@ func (b *Broker) load() error {
 			}
 			for _, off := range s.Quarantined {
 				st.quarantined[off] = true
+			}
+			for _, off := range s.Abandoned {
+				st.abandoned[off] = true
 			}
 			b.subs[s.Topic+"/"+s.Name] = st
 		}
@@ -235,6 +240,9 @@ func (b *Broker) flushLocked() error {
 		}
 		for off := range s.quarantined {
 			d.Quarantined = append(d.Quarantined, off)
+		}
+		for off := range s.abandoned {
+			d.Abandoned = append(d.Abandoned, off)
 		}
 		sd.Subs = append(sd.Subs, d)
 	}

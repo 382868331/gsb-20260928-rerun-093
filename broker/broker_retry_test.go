@@ -116,14 +116,29 @@ func TestQuarantineDoesNotBlock(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// 两个位置分开表示：连续确认位置停在 0（隔离不等于业务确认），
+	// 可投递位置为 3（隔离视为已处理，投递可越过）。
 	pos, _ := b.Position("orders", "workers")
-	if pos != 3 {
-		t.Fatalf("position = %d, want 3 (quarantine counts as resolved)", pos)
+	if pos != 0 {
+		t.Fatalf("position = %d, want 0 (quarantine is not ack)", pos)
 	}
-	// 但隔离消息没有确认去向，不会被误认成已完成。
+	dpos, _ := b.DeliverablePosition("orders", "workers")
+	if dpos != 3 {
+		t.Fatalf("deliverable position = %d, want 3 (quarantine counts as resolved)", dpos)
+	}
+	// 隔离消息没有确认去向，不会被误认成已完成。
 	dest, _ := b.AckedBy("orders", "workers")
 	if _, ok := dest[0]; ok {
 		t.Fatalf("quarantined offset 0 must not appear in AckedBy: %v", dest)
+	}
+	// 数量核对：3 条全部交付过，2 条确认，1 条隔离，无待处理。
+	c, err := b.Counts("orders", "workers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Counts{Total: 3, Delivered: 3, Acked: 2, Quarantined: 1, Abandoned: 0, Pending: 0}
+	if c != want {
+		t.Fatalf("counts = %+v, want %+v", c, want)
 	}
 }
 
