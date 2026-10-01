@@ -46,6 +46,7 @@ const (
 	EventAck        = "ack"        // 确认完成
 	EventQuarantine = "quarantine" // 失败次数达上限被隔离
 	EventRedeliver  = "redeliver"  // 人工重新投递（保留原身份，开启新尝试）
+	EventAbandon    = "abandon"    // 人工明确放弃被隔离的消息（不再投递）
 )
 
 // HistoryEvent 是消息历史中的一条记录：每一次领取、超时、拒绝、
@@ -106,8 +107,30 @@ type subState struct {
 	failures    map[int64]int       // 每条消息累计失败（nack）次数
 	retryAt     map[int64]time.Time // 退避截止时间，此前不再投递
 	quarantined map[int64]bool      // 隔离集合：不再自动投递，不阻塞后续消息
+	abandoned   map[int64]bool      // 明确放弃集合：人工判定不再投递（不同于业务确认）
+	attempts    map[int64]int       // 每条消息累计投递尝试次数（重投/重启不重置）
 	maxFailures int
 	backoffBase time.Duration
+}
+
+// Progress 汇总一个订阅当前的消费进度与各类消息数量。
+//
+// 三个位置含义不同，不能混用：
+//   - Position（消费位置）：连续已处理前缀长度。前缀中的消息要么已业务确认，
+//     要么被人工明确放弃；仅被隔离的消息仍是空洞，不会越过它推进。
+//   - AckPosition（连续确认位置）：连续业务确认前缀长度，隔离与放弃都不算确认。
+//   - DeliverPosition（可投递位置）：可安全跳过的连续前缀长度（已确认/已放弃/已隔离），
+//     表示后续消息已可持续投递，并不代表空洞中的消息已完成。
+type Progress struct {
+	Total           int64 // 主题消息总数
+	Delivered       int64 // 至少投递过一次的消息数（依据历史中的 deliver 事件）
+	Acked           int64 // 已业务确认的消息数
+	Quarantined     int64 // 当前被隔离、仍待人工处置的消息数
+	Abandoned       int64 // 已被人工明确放弃、不再投递的消息数
+	Pending         int64 // 仍待处理（在途/退避中/等待投递）的消息数
+	Position        int64
+	AckPosition     int64
+	DeliverPosition int64
 }
 
 // Broker 是消息投递运行系统本体。
@@ -173,6 +196,8 @@ func (b *Broker) CreateSubscription(topic, name string) error {
 		failures:    map[int64]int{},
 		retryAt:     map[int64]time.Time{},
 		quarantined: map[int64]bool{},
+		abandoned:   map[int64]bool{},
+		attempts:    map[int64]int{},
 		maxFailures: defaultMaxFailures,
 		backoffBase: defaultBackoffBase,
 	}
@@ -249,7 +274,7 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 	reclaimed := false
 	for off, f := range s.inFlight {
 		if !f.deadline.After(now) {
-			if err := b.recordHistoryLocked(s, off, EventTimeout, f.owner, f.epoch, s.failures[off]+1, ""); err != nil {
+			if err := b.recordHistoryLocked(s, off, EventTimeout, f.owner, f.epoch, s.attempts[off], ""); err != nil {
 				return nil, err
 			}
 			delete(s.inFlight, off)
@@ -270,6 +295,9 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 		if s.quarantined[off] {
 			continue // 隔离不阻塞同订阅后续可处理消息
 		}
+		if s.abandoned[off] {
+			continue // 已明确放弃，永不投递
+		}
 		if msgs[off].VisibleAt.After(now) {
 			continue // 延迟投递尚未到期
 		}
@@ -282,7 +310,8 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 		s.epochSeq++
 		f := &inFlight{owner: consumerID, epoch: s.epochSeq, deadline: now.Add(visibilityTimeout)}
 		s.inFlight[off] = f
-		attempt := s.failures[off] + 1
+		s.attempts[off]++
+		attempt := s.attempts[off]
 		if err := b.recordHistoryLocked(s, off, EventDeliver, consumerID, f.epoch, attempt, ""); err != nil {
 			return nil, err
 		}
@@ -329,6 +358,7 @@ func (b *Broker) Ack(topic, sub, consumerID, tok string) error {
 	s.acked[off] = true
 	delete(s.inFlight, off)
 	delete(s.retryAt, off)
+	delete(s.failures, off)
 	b.acks = append(b.acks, AckRecord{
 		Topic:    topic,
 		Offset:   off,
@@ -340,7 +370,7 @@ func (b *Broker) Ack(topic, sub, consumerID, tok string) error {
 	if err := b.appendAckLocked(b.acks[len(b.acks)-1]); err != nil {
 		return err
 	}
-	if err := b.recordHistoryLocked(s, off, EventAck, consumerID, epoch, s.failures[off]+1, ""); err != nil {
+	if err := b.recordHistoryLocked(s, off, EventAck, consumerID, epoch, s.attempts[off], ""); err != nil {
 		return err
 	}
 	return b.flushLocked()
@@ -375,13 +405,13 @@ func (b *Broker) Nack(topic, sub, consumerID, tok string) error {
 	now := b.now()
 	backoff := s.backoffBase << (s.failures[off] - 1)
 	s.retryAt[off] = now.Add(backoff)
-	if err := b.recordHistoryLocked(s, off, EventNack, consumerID, epoch, s.failures[off], ""); err != nil {
+	if err := b.recordHistoryLocked(s, off, EventNack, consumerID, epoch, s.attempts[off], ""); err != nil {
 		return err
 	}
 	if s.failures[off] >= s.maxFailures {
 		s.quarantined[off] = true
 		delete(s.retryAt, off)
-		if err := b.recordHistoryLocked(s, off, EventQuarantine, consumerID, epoch, s.failures[off], ""); err != nil {
+		if err := b.recordHistoryLocked(s, off, EventQuarantine, consumerID, epoch, s.attempts[off], ""); err != nil {
 			return err
 		}
 	}
@@ -389,7 +419,8 @@ func (b *Broker) Nack(topic, sub, consumerID, tok string) error {
 }
 
 // Redeliver 人工重新投递一条被隔离的消息：保留原消息身份（主题/偏移/内容），
-// 清除隔离与失败计数，下一次 Pull 以新纪元、新尝试投递。操作者记入历史。
+// 清除隔离与失败计数，下一次 Pull 以新纪元投递。尝试序号不重置，
+// 而是在原有尝试历史之上继续累计；操作者与事由记入历史。
 func (b *Broker) Redeliver(topic, sub string, offset int64, operator string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -409,7 +440,36 @@ func (b *Broker) Redeliver(topic, sub string, offset int64, operator string) err
 	delete(s.quarantined, offset)
 	delete(s.retryAt, offset)
 	s.failures[offset] = 0
-	if err := b.recordHistoryLocked(s, offset, EventRedeliver, operator, 0, 1, "manual redeliver"); err != nil {
+	detail := "manual redeliver"
+	if err := b.recordHistoryLocked(s, offset, EventRedeliver, operator, 0, s.attempts[offset], detail); err != nil {
+		return err
+	}
+	return b.flushLocked()
+}
+
+// Abandon 人工明确放弃一条被隔离的消息：它永远不会再被自动或人工投递，
+// 但与业务确认严格区分。放弃后连续消费位置（Position）可越过该消息，
+// 连续确认位置（AckPosition）仍停在它之前；操作者与事由记入历史。
+func (b *Broker) Abandon(topic, sub string, offset int64, operator, reason string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return err
+	}
+	if offset < 0 || offset >= int64(len(b.topics[topic])) {
+		return ErrNoMessage
+	}
+	if s.acked[offset] {
+		return ErrAlreadyAcked
+	}
+	if !s.quarantined[offset] {
+		return ErrNotQuarantined
+	}
+	delete(s.quarantined, offset)
+	delete(s.retryAt, offset)
+	s.abandoned[offset] = true
+	if err := b.recordHistoryLocked(s, offset, EventAbandon, operator, 0, s.attempts[offset], reason); err != nil {
 		return err
 	}
 	return b.flushLocked()
@@ -465,8 +525,11 @@ func (b *Broker) recordHistoryLocked(s *subState, off int64, event, consumer str
 	return b.appendHistoryLocked(e)
 }
 
-// Position 返回订阅的消费位置：连续已处理前缀长度（已确认或已隔离均视为已处理；
-// 被隔离的消息可通过 Quarantined 单独核对，不会被误认成已确认）。
+// Position 返回订阅的消费位置：连续“已处理”前缀长度。前缀中的消息要么已业务确认，
+// 要么被人工明确放弃（Abandon）。仅被隔离而尚未处置的消息仍是未完成空洞，
+// Position 停在它之前，绝不会把隔离误计为业务确认完成。
+//
+// 若只想知道“后续消息是否已可持续投递”（允许越过隔离空洞），请用 DeliverPosition。
 func (b *Broker) Position(topic, sub string) (int64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -475,10 +538,105 @@ func (b *Broker) Position(topic, sub string) (int64, error) {
 		return 0, err
 	}
 	pos := int64(0)
-	for s.acked[pos] || s.quarantined[pos] {
+	for s.acked[pos] || s.abandoned[pos] {
 		pos++
 	}
 	return pos, nil
+}
+
+// AckPosition 返回连续业务确认前缀长度。隔离与明确放弃都不算确认，
+// 因此中间只要存在未确认消息，AckPosition 就停在那里，即便其后的消息已确认。
+func (b *Broker) AckPosition(topic, sub string) (int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return 0, err
+	}
+	pos := int64(0)
+	for s.acked[pos] {
+		pos++
+	}
+	return pos, nil
+}
+
+// DeliverPosition 返回可安全越过的连续前缀长度：已确认、已明确放弃或已隔离
+// 的消息都不再阻塞后续投递。它回答“后续消息能否继续投递”，
+// 而不代表越过的消息在业务上已经完成（隔离/放弃不是确认）。
+func (b *Broker) DeliverPosition(topic, sub string) (int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return 0, err
+	}
+	pos := int64(0)
+	for s.acked[pos] || s.abandoned[pos] || s.quarantined[pos] {
+		pos++
+	}
+	return pos, nil
+}
+
+// Abandoned 返回订阅当前被人工明确放弃的消息偏移（升序）。
+func (b *Broker) Abandoned(topic, sub string) ([]int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return nil, err
+	}
+	var out []int64
+	for off := range s.abandoned {
+		out = append(out, off)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// Progress 返回订阅的进度概览：三个位置与已交付/已确认/隔离/放弃/待处理数量，
+// 可在重启后分别核对，互相印证（Acked+Quarantined+Abandoned+Pending == Total）。
+func (b *Broker) Progress(topic, sub string) (Progress, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return Progress{}, err
+	}
+	total := int64(len(b.topics[topic]))
+	p := Progress{Total: total}
+	delivered := map[int64]bool{}
+	for _, e := range b.history {
+		if e.Topic == topic && e.Sub == sub && e.Event == EventDeliver {
+			delivered[e.Offset] = true
+		}
+	}
+	p.Delivered = int64(len(delivered))
+	for off := int64(0); off < total; off++ {
+		switch {
+		case s.acked[off]:
+			p.Acked++
+		case s.abandoned[off]:
+			p.Abandoned++
+		case s.quarantined[off]:
+			p.Quarantined++
+		default:
+			p.Pending++
+		}
+	}
+	p.Position = prefixLen(total, func(off int64) bool { return s.acked[off] || s.abandoned[off] })
+	p.AckPosition = prefixLen(total, func(off int64) bool { return s.acked[off] })
+	p.DeliverPosition = prefixLen(total, func(off int64) bool {
+		return s.acked[off] || s.abandoned[off] || s.quarantined[off]
+	})
+	return p, nil
+}
+
+func prefixLen(total int64, done func(int64) bool) int64 {
+	pos := int64(0)
+	for pos < total && done(pos) {
+		pos++
+	}
+	return pos
 }
 
 // AckedBy 返回每条消息的实际去向（offset -> 确认它的消费者）。

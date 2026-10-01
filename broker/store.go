@@ -24,6 +24,8 @@ type subDisk struct {
 	Failures    map[int64]int       `json:"failures,omitempty"`
 	RetryAt     map[int64]time.Time `json:"retry_at,omitempty"`
 	Quarantined []int64             `json:"quarantined,omitempty"`
+	Abandoned   []int64             `json:"abandoned,omitempty"`
+	Attempts    map[int64]int       `json:"attempts,omitempty"`
 	MaxFailures int                 `json:"max_failures,omitempty"`
 	BackoffBase time.Duration       `json:"backoff_base,omitempty"`
 }
@@ -94,6 +96,8 @@ func (b *Broker) load() error {
 				failures:    map[int64]int{},
 				retryAt:     map[int64]time.Time{},
 				quarantined: map[int64]bool{},
+				abandoned:   map[int64]bool{},
+				attempts:    map[int64]int{},
 				maxFailures: s.MaxFailures,
 				backoffBase: s.BackoffBase,
 			}
@@ -114,6 +118,12 @@ func (b *Broker) load() error {
 			}
 			for _, off := range s.Quarantined {
 				st.quarantined[off] = true
+			}
+			for _, off := range s.Abandoned {
+				st.abandoned[off] = true
+			}
+			for off, n := range s.Attempts {
+				st.attempts[off] = n
 			}
 			b.subs[s.Topic+"/"+s.Name] = st
 		}
@@ -235,6 +245,12 @@ func (b *Broker) flushLocked() error {
 		}
 		for off := range s.quarantined {
 			d.Quarantined = append(d.Quarantined, off)
+		}
+		for off := range s.abandoned {
+			d.Abandoned = append(d.Abandoned, off)
+		}
+		if len(s.attempts) > 0 {
+			d.Attempts = s.attempts
 		}
 		sd.Subs = append(sd.Subs, d)
 	}

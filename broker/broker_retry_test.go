@@ -116,9 +116,19 @@ func TestQuarantineDoesNotBlock(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// 隔离不是业务确认：连续确认/消费位置停在空洞之前，
+	// 但“可继续投递后续消息”的位置越过隔离点。
 	pos, _ := b.Position("orders", "workers")
-	if pos != 3 {
-		t.Fatalf("position = %d, want 3 (quarantine counts as resolved)", pos)
+	if pos != 0 {
+		t.Fatalf("position = %d, want 0 (quarantine is an open hole)", pos)
+	}
+	ackPos, _ := b.AckPosition("orders", "workers")
+	if ackPos != 0 {
+		t.Fatalf("ack position = %d, want 0", ackPos)
+	}
+	dpos, _ := b.DeliverPosition("orders", "workers")
+	if dpos != 3 {
+		t.Fatalf("deliver position = %d, want 3", dpos)
 	}
 	// 但隔离消息没有确认去向，不会被误认成已完成。
 	dest, _ := b.AckedBy("orders", "workers")
