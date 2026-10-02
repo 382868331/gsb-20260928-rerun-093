@@ -19,6 +19,7 @@ import (
 type subDisk struct {
 	Name        string              `json:"name"`
 	Topic       string              `json:"topic"`
+	Owner       string              `json:"owner,omitempty"`
 	Acked       []int64             `json:"acked"`
 	EpochSeq    uint64              `json:"epoch_seq"`
 	Failures    map[int64]int       `json:"failures,omitempty"`
@@ -89,6 +90,7 @@ func (b *Broker) load() error {
 			st := &subState{
 				name:        s.Name,
 				topic:       s.Topic,
+				owner:       s.Owner,
 				acked:       map[int64]bool{},
 				inFlight:    map[int64]*inFlight{},
 				epochSeq:    s.EpochSeq,
@@ -229,6 +231,7 @@ func (b *Broker) flushLocked() error {
 		d := subDisk{
 			Name:        s.name,
 			Topic:       s.topic,
+			Owner:       s.owner,
 			EpochSeq:    s.epochSeq,
 			Failures:    s.failures,
 			RetryAt:     s.retryAt,

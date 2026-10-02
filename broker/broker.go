@@ -1,6 +1,7 @@
 // Package broker 实现本地持久化消息投递运行系统：
 // 主题、订阅、消费位置、独占投递（带超时转交与纪元 fencing）、确认与重启恢复；
 // 以及延迟投递、失败退避、隔离与人工重新投递、全量消息历史。
+// 并支持订阅（分区）处理权在逻辑消费者之间的受控交接。
 package broker
 
 import (
@@ -47,6 +48,7 @@ const (
 	EventQuarantine = "quarantine" // 失败次数达上限被隔离
 	EventRedeliver  = "redeliver"  // 人工重新投递（保留原身份，开启新尝试）
 	EventAbandon    = "abandon"    // 人工明确放弃（终态，不再投递，也不算确认）
+	EventHandover   = "handover"   // 处理权交接（消费者之间受控移交）
 )
 
 // HistoryEvent 是消息历史中的一条记录：每一次领取、超时、拒绝、
@@ -83,6 +85,9 @@ var (
 	ErrAlreadyAcked   = errors.New("broker: message already acknowledged")
 	ErrNoMessage      = errors.New("broker: no such message")
 	ErrNotQuarantined = errors.New("broker: message is not quarantined")
+	// ErrHandoverPending 表示选择了等待原消费者完成当前处理的交接，
+	// 但分区仍有在途消息，交接尚未确认；调用方可在原消费者完成后重试。
+	ErrHandoverPending = errors.New("broker: handover pending: in-flight messages not finished")
 )
 
 // 默认重试策略。
@@ -100,6 +105,7 @@ type inFlight struct {
 type subState struct {
 	name     string
 	topic    string
+	owner    string // 当前被指派的逻辑消费者（空表示未指派，任何消费者可拉取）
 	acked    map[int64]bool
 	inFlight map[int64]*inFlight
 	epochSeq uint64
@@ -255,6 +261,9 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 	s, err := b.subLocked(topic, sub)
 	if err != nil {
 		return nil, err
+	}
+	if s.owner != "" && consumerID != s.owner {
+		return nil, ErrNotOwner
 	}
 	msgs := b.topics[topic]
 	now := b.now()
@@ -490,6 +499,132 @@ func (b *Broker) Abandoned(topic, sub string) ([]int64, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
+}
+
+// HandoverOptions 控制一次处理权交接的方式。
+type HandoverOptions struct {
+	// Reason 记录交接原因，写入每条被移交消息的历史。
+	Reason string
+	// Wait 为 true 时等待原消费者完成当前处理：分区仍有在途消息则
+	// 交接不确认并返回 ErrHandoverPending，调用方可在其完成后重试。
+	// Wait 为 false 时立即撤回原消费者的处理权：在途消息被释放，
+	// 旧持有人的 Token 即刻失效，新消费者下一次 Pull 即可接手。
+	Wait bool
+}
+
+// HandoverPreview 是一次交接的预览/结果：列出尚未完成（在途）、
+// 已隔离与等待重投（退避中）的消息，并给出交接前后的消费位置。
+// 交接本身不确认任何消息，也不抹平隔离形成的空洞，因此前后位置一致。
+type HandoverPreview struct {
+	Topic string `json:"topic"`
+	Sub   string `json:"sub"`
+	From  string `json:"from"` // 当前处理者（空表示未指派）
+	To    string `json:"to"`
+
+	InFlight    []int64 `json:"in_flight,omitempty"`   // 尚未完成：当前被持有、未确认
+	Retrying    []int64 `json:"retrying,omitempty"`    // 等待重投：失败退避中
+	Quarantined []int64 `json:"quarantined,omitempty"` // 已隔离
+
+	PositionBefore    int64 `json:"position_before"`
+	PositionAfter     int64 `json:"position_after"`
+	DeliverableBefore int64 `json:"deliverable_before"`
+	DeliverableAfter  int64 `json:"deliverable_after"`
+}
+
+// Owner 返回订阅当前被指派的逻辑消费者（空表示未指派）。
+func (b *Broker) Owner(topic, sub string) (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return "", err
+	}
+	return s.owner, nil
+}
+
+// handoverPreviewLocked 组装预览。调用方须持有锁。
+func (b *Broker) handoverPreviewLocked(s *subState, to string) HandoverPreview {
+	p := HandoverPreview{Topic: s.topic, Sub: s.name, From: s.owner, To: to}
+	now := b.now()
+	for off := range s.inFlight {
+		p.InFlight = append(p.InFlight, off)
+	}
+	for off, t := range s.retryAt {
+		if _, held := s.inFlight[off]; !held && t.After(now) {
+			p.Retrying = append(p.Retrying, off)
+		}
+	}
+	for off := range s.quarantined {
+		p.Quarantined = append(p.Quarantined, off)
+	}
+	sort.Slice(p.InFlight, func(i, j int) bool { return p.InFlight[i] < p.InFlight[j] })
+	sort.Slice(p.Retrying, func(i, j int) bool { return p.Retrying[i] < p.Retrying[j] })
+	sort.Slice(p.Quarantined, func(i, j int) bool { return p.Quarantined[i] < p.Quarantined[j] })
+	pos := int64(0)
+	for s.acked[pos] {
+		pos++
+	}
+	p.PositionBefore, p.PositionAfter = pos, pos
+	dpos := int64(0)
+	for s.acked[dpos] || s.quarantined[dpos] || s.abandoned[dpos] {
+		dpos++
+	}
+	p.DeliverableBefore, p.DeliverableAfter = dpos, dpos
+	return p
+}
+
+// HandoverPreview 预览把订阅（分区）的处理权移交给 to 时的影响，
+// 不改变任何状态。
+func (b *Broker) HandoverPreview(topic, sub, to string) (HandoverPreview, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return HandoverPreview{}, err
+	}
+	return b.handoverPreviewLocked(s, to), nil
+}
+
+// Handover 把订阅（分区）的处理权从当前消费者受控移交给 to。
+// 只影响本订阅，其他订阅继续由原消费者处理。交接是单次原子操作并落盘，
+// 中途退出或重新打开后归属与处理记录保持一致；对同一目标的重复请求是
+// 幂等的（归属已是 to 时直接返回当前预览，不重复记录历史）。
+// 交接确认后，旧消费者迟到的确认或重投（nack）请求因 Token 失效被明确拒绝。
+func (b *Broker) Handover(topic, sub, to string, opts HandoverOptions) (HandoverPreview, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return HandoverPreview{}, err
+	}
+	p := b.handoverPreviewLocked(s, to)
+	if s.owner == to {
+		return p, nil // 幂等：归属已是 to
+	}
+	if opts.Wait && len(s.inFlight) > 0 {
+		return p, ErrHandoverPending
+	}
+	from := s.owner
+	detail := "handover from " + from + " to " + to
+	if opts.Reason != "" {
+		detail += ": " + opts.Reason
+	}
+	// 撤回在途消息的处理权：释放并记录，新消费者下一次 Pull 以新纪元接手。
+	for _, off := range p.InFlight {
+		delete(s.inFlight, off)
+		if err := b.recordHistoryLocked(s, off, EventHandover, to, 0, s.failures[off]+1, detail); err != nil {
+			return HandoverPreview{}, err
+		}
+	}
+	s.owner = to
+	// 订阅级交接记录（offset -1，不属于任何具体消息）。
+	if err := b.recordHistoryLocked(s, -1, EventHandover, to, 0, 0, detail); err != nil {
+		return HandoverPreview{}, err
+	}
+	if err := b.flushLocked(); err != nil {
+		return HandoverPreview{}, err
+	}
+	return p, nil
 }
 
 // Counts 返回订阅的数量核对视图：已交付（按历史去重）、已确认、
