@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -27,6 +28,8 @@ type subDisk struct {
 	Abandoned   []int64             `json:"abandoned,omitempty"`
 	MaxFailures int                 `json:"max_failures,omitempty"`
 	BackoffBase time.Duration       `json:"backoff_base,omitempty"`
+	GrantSeq    uint64              `json:"grant_seq,omitempty"`
+	Grants      []PartitionGrant    `json:"grants,omitempty"`
 }
 
 type stateDisk struct {
@@ -98,6 +101,8 @@ func (b *Broker) load() error {
 				abandoned:   map[int64]bool{},
 				maxFailures: s.MaxFailures,
 				backoffBase: s.BackoffBase,
+				grants:      map[string]*PartitionGrant{},
+				grantSeq:    s.GrantSeq,
 			}
 			if st.maxFailures < 1 {
 				st.maxFailures = defaultMaxFailures
@@ -119,6 +124,10 @@ func (b *Broker) load() error {
 			}
 			for _, off := range s.Abandoned {
 				st.abandoned[off] = true
+			}
+			for i := range s.Grants {
+				g := s.Grants[i]
+				st.grants[g.ID] = &g
 			}
 			b.subs[s.Topic+"/"+s.Name] = st
 		}
@@ -170,6 +179,17 @@ func (b *Broker) load() error {
 		if err := sc.Err(); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (b *Broker) processGrantsAndFlushLocked(s *subState, now time.Time) error {
+	changed, err := b.processGrantsLocked(s, now)
+	if err != nil {
+		return err
+	}
+	if changed {
+		return b.flushLocked()
 	}
 	return nil
 }
@@ -234,6 +254,7 @@ func (b *Broker) flushLocked() error {
 			RetryAt:     s.retryAt,
 			MaxFailures: s.maxFailures,
 			BackoffBase: s.backoffBase,
+			GrantSeq:    s.grantSeq,
 		}
 		for off := range s.acked {
 			d.Acked = append(d.Acked, off)
@@ -244,6 +265,10 @@ func (b *Broker) flushLocked() error {
 		for off := range s.abandoned {
 			d.Abandoned = append(d.Abandoned, off)
 		}
+		for _, g := range s.grants {
+			d.Grants = append(d.Grants, *cloneGrant(g))
+		}
+		sort.Slice(d.Grants, func(i, j int) bool { return d.Grants[i].Seq < d.Grants[j].Seq })
 		sd.Subs = append(sd.Subs, d)
 	}
 	data, err := json.MarshalIndent(sd, "", "  ")

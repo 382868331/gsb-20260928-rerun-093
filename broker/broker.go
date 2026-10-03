@@ -36,31 +36,45 @@ type Delivery struct {
 	Owner    string
 	Deadline time.Time
 	Attempt  int
+	GrantID  string
 }
 
 // 历史事件类型。
 const (
-	EventDeliver    = "deliver"    // 一次领取（投递给某消费者）
-	EventTimeout    = "timeout"    // 可见期超时被回收
-	EventNack       = "nack"       // 持有人明确拒绝（进入退避）
-	EventAck        = "ack"        // 确认完成
-	EventQuarantine = "quarantine" // 失败次数达上限被隔离
-	EventRedeliver  = "redeliver"  // 人工重新投递（保留原身份，开启新尝试）
-	EventAbandon    = "abandon"    // 人工明确放弃（终态，不再投递，也不算确认）
+	EventDeliver     = "deliver"    // 一次领取（投递给某消费者）
+	EventTimeout     = "timeout"    // 可见期超时被回收
+	EventNack        = "nack"       // 持有人明确拒绝（进入退避）
+	EventAck         = "ack"        // 确认完成
+	EventQuarantine  = "quarantine" // 失败次数达上限被隔离
+	EventRedeliver   = "redeliver"  // 人工重新投递（保留原身份，开启新尝试）
+	EventAbandon     = "abandon"    // 人工明确放弃（终态，不再投递，也不算确认）
+	EventGrant       = "grant"      // 建立临时分区授权（可能尚未开始）
+	EventGrantStart  = "grant_start"
+	EventGrantCancel = "grant_cancel"
+	EventGrantReturn = "grant_return"
+	EventGrantRevoke = "grant_revoke"
 )
 
 // HistoryEvent 是消息历史中的一条记录：每一次领取、超时、拒绝、
 // 确认、隔离与人工重投都会留下一条，最终确认者不会代替全部尝试记录。
 type HistoryEvent struct {
-	Topic    string    `json:"topic"`
-	Offset   int64     `json:"offset"`
-	Sub      string    `json:"sub"`
-	Event    string    `json:"event"`
-	Consumer string    `json:"consumer"` // 投递/确认的消费者，或人工重投的操作者
-	Epoch    uint64    `json:"epoch"`
-	Attempt  int       `json:"attempt"`
-	At       time.Time `json:"at"`
-	Detail   string    `json:"detail,omitempty"`
+	Topic        string    `json:"topic"`
+	Offset       int64     `json:"offset"`
+	Sub          string    `json:"sub"`
+	Event        string    `json:"event"`
+	Consumer     string    `json:"consumer"` // 投递/确认的消费者，或人工重投的操作者
+	Epoch        uint64    `json:"epoch"`
+	Attempt      int       `json:"attempt"`
+	At           time.Time `json:"at"`
+	Detail       string    `json:"detail,omitempty"`
+	Partition    string    `json:"partition,omitempty"`
+	GrantID      string    `json:"grant_id,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
+	FromConsumer string    `json:"from_consumer,omitempty"`
+	ToConsumer   string    `json:"to_consumer,omitempty"`
+	Partitions   []string  `json:"partitions,omitempty"`
+	StartsAt     time.Time `json:"starts_at,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
 }
 
 // AckRecord 记录一条消息的最终去向（由谁确认）。
@@ -83,6 +97,11 @@ var (
 	ErrAlreadyAcked   = errors.New("broker: message already acknowledged")
 	ErrNoMessage      = errors.New("broker: no such message")
 	ErrNotQuarantined = errors.New("broker: message is not quarantined")
+	ErrInvalidGrant   = errors.New("broker: invalid partition grant")
+	ErrGrantNotFound  = errors.New("broker: partition grant not found")
+	ErrGrantStarted   = errors.New("broker: partition grant already started")
+	ErrGrantFinished  = errors.New("broker: partition grant already finished")
+	ErrPartitionBusy  = errors.New("broker: partition has an overlapping grant")
 )
 
 // 默认重试策略。
@@ -95,6 +114,61 @@ type inFlight struct {
 	owner    string
 	epoch    uint64
 	deadline time.Time
+	grantID  string
+}
+
+type HandoverMode string
+
+const (
+	// HandoverWait 保留旧持有人已领取消息的处理权，等待其自然确认或拒绝。
+	HandoverWait HandoverMode = "wait"
+	// HandoverRevoke 立即撤回旧处理权，旧令牌马上失效。
+	HandoverRevoke HandoverMode = "revoke"
+)
+
+const (
+	grantScheduled = "scheduled"
+	grantActive    = "active"
+	grantDraining  = "draining"
+	grantCompleted = "completed"
+	grantCanceled  = "canceled"
+)
+
+// PartitionGrant 描述一个有明确范围和期限的临时分区授权。
+type PartitionGrant struct {
+	ID           string       `json:"id"`
+	Topic        string       `json:"topic"`
+	Sub          string       `json:"sub"`
+	Partitions   []string     `json:"partitions"`
+	FromConsumer string       `json:"from_consumer"`
+	ToConsumer   string       `json:"to_consumer"`
+	Reason       string       `json:"reason"`
+	Mode         HandoverMode `json:"mode"`
+	CreatedAt    time.Time    `json:"created_at"`
+	StartsAt     time.Time    `json:"starts_at"`
+	ExpiresAt    time.Time    `json:"expires_at"`
+	Status       string       `json:"status"`
+	Seq          uint64       `json:"seq"`
+}
+
+// PartitionWork 是交接前的分区工作清单。
+type PartitionWork struct {
+	Partition   string
+	InFlight    []int64 // 已领取但尚未确认/拒绝
+	Retrying    []int64 // 退避后等待自动重投
+	Quarantined []int64 // 已隔离，等待人工重投或放弃
+	Unstarted   []int64 // 尚未进入处理流程的消息
+}
+
+// PartitionGrantRequest 请求把一组分区临时交给另一名逻辑消费者。
+type PartitionGrantRequest struct {
+	Partitions   []string
+	FromConsumer string
+	ToConsumer   string
+	Reason       string
+	Mode         HandoverMode
+	StartsAt     time.Time
+	ExpiresAt    time.Time
 }
 
 type subState struct {
@@ -110,6 +184,8 @@ type subState struct {
 	abandoned   map[int64]bool      // 放弃集合：人工明确放弃的终态，不等于确认
 	maxFailures int
 	backoffBase time.Duration
+	grants      map[string]*PartitionGrant
+	grantSeq    uint64
 }
 
 // Counts 是订阅的消息数量核对视图，用于分别核对
@@ -189,6 +265,7 @@ func (b *Broker) CreateSubscription(topic, name string) error {
 		abandoned:   map[int64]bool{},
 		maxFailures: defaultMaxFailures,
 		backoffBase: defaultBackoffBase,
+		grants:      map[string]*PartitionGrant{},
 	}
 	return b.flushLocked()
 }
@@ -258,15 +335,21 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 	}
 	msgs := b.topics[topic]
 	now := b.now()
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
+		return nil, err
+	}
 
 	// 回收超时在途消息：旧 Token 即刻失效（fencing）。
 	reclaimed := false
 	for off, f := range s.inFlight {
 		if !f.deadline.After(now) {
-			if err := b.recordHistoryLocked(s, off, EventTimeout, f.owner, f.epoch, s.failures[off]+1, ""); err != nil {
+			if err := b.recordMessageHistoryLocked(s, off, EventTimeout, f.owner, f.epoch, s.failures[off]+1, f.grantID, ""); err != nil {
 				return nil, err
 			}
 			delete(s.inFlight, off)
+			if err := b.completeDrainingGrantsLocked(s, []string{b.topics[topic][off].Key}, now); err != nil {
+				return nil, err
+			}
 			reclaimed = true
 		}
 	}
@@ -296,11 +379,15 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 		if _, held := s.inFlight[off]; held {
 			continue
 		}
+		if !b.canPullLocked(s, msgs[off].Key, consumerID, now) {
+			continue
+		}
 		s.epochSeq++
-		f := &inFlight{owner: consumerID, epoch: s.epochSeq, deadline: now.Add(visibilityTimeout)}
+		grantID := b.activeGrantIDLocked(s, msgs[off].Key, now)
+		f := &inFlight{owner: consumerID, epoch: s.epochSeq, deadline: now.Add(visibilityTimeout), grantID: grantID}
 		s.inFlight[off] = f
 		attempt := s.failures[off] + 1
-		if err := b.recordHistoryLocked(s, off, EventDeliver, consumerID, f.epoch, attempt, ""); err != nil {
+		if err := b.recordMessageHistoryLocked(s, off, EventDeliver, consumerID, f.epoch, attempt, grantID, ""); err != nil {
 			return nil, err
 		}
 		out = append(out, Delivery{
@@ -310,6 +397,7 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 			Owner:    consumerID,
 			Deadline: f.deadline,
 			Attempt:  attempt,
+			GrantID:  grantID,
 		})
 	}
 	if len(out) > 0 {
@@ -327,6 +415,9 @@ func (b *Broker) Ack(topic, sub, consumerID, tok string) error {
 	defer b.mu.Unlock()
 	s, err := b.subLocked(topic, sub)
 	if err != nil {
+		return err
+	}
+	if err := b.processGrantsAndFlushLocked(s, b.now()); err != nil {
 		return err
 	}
 	off, epoch, err := parseToken(topic, sub, tok)
@@ -357,7 +448,11 @@ func (b *Broker) Ack(topic, sub, consumerID, tok string) error {
 	if err := b.appendAckLocked(b.acks[len(b.acks)-1]); err != nil {
 		return err
 	}
-	if err := b.recordHistoryLocked(s, off, EventAck, consumerID, epoch, s.failures[off]+1, ""); err != nil {
+	if err := b.recordMessageHistoryLocked(s, off, EventAck, consumerID, epoch, s.failures[off]+1, f.grantID, ""); err != nil {
+		return err
+	}
+	partitions := []string{b.topics[topic][off].Key}
+	if err := b.completeDrainingGrantsLocked(s, partitions, b.now()); err != nil {
 		return err
 	}
 	return b.flushLocked()
@@ -371,6 +466,9 @@ func (b *Broker) Nack(topic, sub, consumerID, tok string) error {
 	defer b.mu.Unlock()
 	s, err := b.subLocked(topic, sub)
 	if err != nil {
+		return err
+	}
+	if err := b.processGrantsAndFlushLocked(s, b.now()); err != nil {
 		return err
 	}
 	off, epoch, err := parseToken(topic, sub, tok)
@@ -392,15 +490,18 @@ func (b *Broker) Nack(topic, sub, consumerID, tok string) error {
 	now := b.now()
 	backoff := s.backoffBase << (s.failures[off] - 1)
 	s.retryAt[off] = now.Add(backoff)
-	if err := b.recordHistoryLocked(s, off, EventNack, consumerID, epoch, s.failures[off], ""); err != nil {
+	if err := b.recordMessageHistoryLocked(s, off, EventNack, consumerID, epoch, s.failures[off], f.grantID, ""); err != nil {
 		return err
 	}
 	if s.failures[off] >= s.maxFailures {
 		s.quarantined[off] = true
 		delete(s.retryAt, off)
-		if err := b.recordHistoryLocked(s, off, EventQuarantine, consumerID, epoch, s.failures[off], ""); err != nil {
+		if err := b.recordMessageHistoryLocked(s, off, EventQuarantine, consumerID, epoch, s.failures[off], f.grantID, ""); err != nil {
 			return err
 		}
+	}
+	if err := b.completeDrainingGrantsLocked(s, []string{b.topics[topic][off].Key}, b.now()); err != nil {
+		return err
 	}
 	return b.flushLocked()
 }
@@ -412,6 +513,10 @@ func (b *Broker) Redeliver(topic, sub string, offset int64, operator string) err
 	defer b.mu.Unlock()
 	s, err := b.subLocked(topic, sub)
 	if err != nil {
+		return err
+	}
+	now := b.now()
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
 		return err
 	}
 	if offset < 0 || offset >= int64(len(b.topics[topic])) {
@@ -426,7 +531,7 @@ func (b *Broker) Redeliver(topic, sub string, offset int64, operator string) err
 	delete(s.quarantined, offset)
 	delete(s.retryAt, offset)
 	s.failures[offset] = 0
-	if err := b.recordHistoryLocked(s, offset, EventRedeliver, operator, 0, 1, "manual redeliver"); err != nil {
+	if err := b.recordMessageHistoryLocked(s, offset, EventRedeliver, operator, 0, 1, b.activeGrantIDLocked(s, b.topics[topic][offset].Key, now), "manual redeliver"); err != nil {
 		return err
 	}
 	return b.flushLocked()
@@ -458,6 +563,10 @@ func (b *Broker) Abandon(topic, sub string, offset int64, operator string) error
 	if err != nil {
 		return err
 	}
+	now := b.now()
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
+		return err
+	}
 	if offset < 0 || offset >= int64(len(b.topics[topic])) {
 		return ErrNoMessage
 	}
@@ -470,7 +579,7 @@ func (b *Broker) Abandon(topic, sub string, offset int64, operator string) error
 	delete(s.quarantined, offset)
 	delete(s.retryAt, offset)
 	s.abandoned[offset] = true
-	if err := b.recordHistoryLocked(s, offset, EventAbandon, operator, 0, s.failures[offset], "manual abandon"); err != nil {
+	if err := b.recordMessageHistoryLocked(s, offset, EventAbandon, operator, 0, s.failures[offset], b.activeGrantIDLocked(s, b.topics[topic][offset].Key, now), "manual abandon"); err != nil {
 		return err
 	}
 	return b.flushLocked()
@@ -489,6 +598,208 @@ func (b *Broker) Abandoned(topic, sub string) ([]int64, error) {
 		out = append(out, off)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// PartitionWorkView 返回一组分区中尚未完成、等待重投和隔离的消息。
+func (b *Broker) PartitionWorkView(topic, sub string, partitions []string) (map[string]PartitionWork, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return nil, err
+	}
+	now := b.now()
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
+		return nil, err
+	}
+	wanted := map[string]bool{}
+	for _, p := range partitions {
+		if p == "" {
+			return nil, ErrInvalidGrant
+		}
+		wanted[p] = true
+	}
+	out := map[string]PartitionWork{}
+	for p := range wanted {
+		out[p] = PartitionWork{Partition: p}
+	}
+	for off, m := range b.topics[topic] {
+		off64 := int64(off)
+		if !wanted[m.Key] || s.acked[off64] || s.abandoned[off64] {
+			continue
+		}
+		w := out[m.Key]
+		switch {
+		case s.quarantined[off64]:
+			w.Quarantined = append(w.Quarantined, off64)
+		case s.inFlight[off64] != nil:
+			w.InFlight = append(w.InFlight, off64)
+		case !m.VisibleAt.After(now) && !s.retryAt[off64].After(now) && b.hasDeliveredLocked(topic, sub, off64):
+			w.Retrying = append(w.Retrying, off64)
+		case s.retryAt[off64].After(now):
+			w.Retrying = append(w.Retrying, off64)
+		default:
+			w.Unstarted = append(w.Unstarted, off64)
+		}
+		out[m.Key] = w
+	}
+	for p, w := range out {
+		sort.Slice(w.InFlight, func(i, j int) bool { return w.InFlight[i] < w.InFlight[j] })
+		sort.Slice(w.Retrying, func(i, j int) bool { return w.Retrying[i] < w.Retrying[j] })
+		sort.Slice(w.Quarantined, func(i, j int) bool { return w.Quarantined[i] < w.Quarantined[j] })
+		sort.Slice(w.Unstarted, func(i, j int) bool { return w.Unstarted[i] < w.Unstarted[j] })
+		out[p] = w
+	}
+	return out, nil
+}
+
+// CreatePartitionGrant 创建带明确范围、期限和交接原因的临时授权。
+// StartsAt 在未来时安排尚未开始；立即开始时按 mode 决定等待旧处理或撤回旧权。
+func (b *Broker) CreatePartitionGrant(topic, sub string, req PartitionGrantRequest) (*PartitionGrant, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return nil, err
+	}
+	now := b.now()
+	parts, err := normalizePartitions(req.Partitions)
+	if err != nil {
+		return nil, err
+	}
+	if req.FromConsumer == "" || req.ToConsumer == "" || req.FromConsumer == req.ToConsumer {
+		return nil, ErrInvalidGrant
+	}
+	if req.Mode != HandoverWait && req.Mode != HandoverRevoke {
+		return nil, ErrInvalidGrant
+	}
+	if req.StartsAt.IsZero() {
+		req.StartsAt = now
+	}
+	if req.ExpiresAt.IsZero() || !req.ExpiresAt.After(req.StartsAt) {
+		return nil, ErrInvalidGrant
+	}
+	if req.StartsAt.Before(now) {
+		req.StartsAt = now
+	}
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
+		return nil, err
+	}
+	if b.hasOverlappingGrantLocked(s, parts, req.StartsAt, req.ExpiresAt, "") {
+		return nil, ErrPartitionBusy
+	}
+	s.grantSeq++
+	g := &PartitionGrant{
+		ID:           fmt.Sprintf("grant-%d", s.grantSeq),
+		Topic:        topic,
+		Sub:          sub,
+		Partitions:   parts,
+		FromConsumer: req.FromConsumer,
+		ToConsumer:   req.ToConsumer,
+		Reason:       req.Reason,
+		Mode:         req.Mode,
+		CreatedAt:    now,
+		StartsAt:     req.StartsAt,
+		ExpiresAt:    req.ExpiresAt,
+		Status:       grantScheduled,
+		Seq:          s.grantSeq,
+	}
+	s.grants[g.ID] = g
+	if err := b.recordGrantLifecycleLocked(s, g, EventGrant, req.FromConsumer, "grant scheduled"); err != nil {
+		return nil, err
+	}
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
+		return nil, err
+	}
+	return cloneGrant(g), b.flushLocked()
+}
+
+// CancelPartitionGrant 取消尚未开始的临时安排；已经开始的事实保留。
+func (b *Broker) CancelPartitionGrant(topic, sub, grantID, operator string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return err
+	}
+	now := b.now()
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
+		return err
+	}
+	g, err := b.grantLocked(s, topic, sub, grantID)
+	if err != nil {
+		return err
+	}
+	if g.Status != grantScheduled {
+		return ErrGrantStarted
+	}
+	g.Status = grantCanceled
+	if err := b.recordGrantLifecycleLocked(s, g, EventGrantCancel, operator, "scheduled grant canceled"); err != nil {
+		return err
+	}
+	return b.flushLocked()
+}
+
+// ReturnPartitionGrant 提前归还。wait 等待临时消费者在途收尾；revoke 立即终止旧授权。
+func (b *Broker) ReturnPartitionGrant(topic, sub, grantID, operator string, mode HandoverMode) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return err
+	}
+	now := b.now()
+	if err := b.processGrantsAndFlushLocked(s, now); err != nil {
+		return err
+	}
+	g, err := b.grantLocked(s, topic, sub, grantID)
+	if err != nil {
+		return err
+	}
+	if mode == "" {
+		mode = g.Mode
+	}
+	if mode != HandoverWait && mode != HandoverRevoke {
+		return ErrInvalidGrant
+	}
+	if g.Status != grantActive && g.Status != grantDraining {
+		return ErrGrantFinished
+	}
+	g.ExpiresAt = now
+	if mode == HandoverRevoke {
+		if err := b.revokeGrantInflightLocked(s, g, now, EventGrantRevoke, operator, "grant force returned"); err != nil {
+			return err
+		}
+		g.Status = grantCompleted
+	} else {
+		g.Status = grantDraining
+		if err := b.recordGrantLifecycleLocked(s, g, EventGrantReturn, operator, "grant returned; waiting for in-flight work"); err != nil {
+			return err
+		}
+	}
+	if err := b.completeDrainingGrantsLocked(s, g.Partitions, now); err != nil {
+		return err
+	}
+	return b.flushLocked()
+}
+
+// PartitionGrants 返回订阅的授权事实（按建立顺序），包含已取消和已完成记录。
+func (b *Broker) PartitionGrants(topic, sub string) ([]PartitionGrant, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.processGrantsAndFlushLocked(s, b.now()); err != nil {
+		return nil, err
+	}
+	var out []PartitionGrant
+	for _, g := range s.grants {
+		out = append(out, *cloneGrant(g))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	return out, nil
 }
 
@@ -523,33 +834,303 @@ func (b *Broker) Counts(topic, sub string) (Counts, error) {
 func (b *Broker) History(topic, sub string, offset int64) ([]HistoryEvent, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, err := b.subLocked(topic, sub); err != nil {
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
 		return nil, err
+	}
+	if err := b.processGrantsAndFlushLocked(s, b.now()); err != nil {
+		return nil, err
+	}
+	if offset >= 0 && offset >= int64(len(b.topics[topic])) {
+		return nil, ErrNoMessage
 	}
 	var out []HistoryEvent
 	for _, e := range b.history {
-		if e.Topic == topic && e.Sub == sub && (offset < 0 || e.Offset == offset) {
+		if e.Topic == topic && e.Sub == sub && (offset < 0 || e.Offset == offset || (e.Offset < 0 && e.Partition == b.topics[topic][offset].Key)) {
 			out = append(out, e)
 		}
 	}
 	return out, nil
 }
 
-// recordHistoryLocked 追加一条历史并落盘。调用方须持有锁。
-func (b *Broker) recordHistoryLocked(s *subState, off int64, event, consumer string, epoch uint64, attempt int, detail string) error {
+// recordMessageHistoryLocked 追加一条消息事件并落盘。调用方须持有锁。
+func (b *Broker) recordMessageHistoryLocked(s *subState, off int64, event, consumer string, epoch uint64, attempt int, grantID, detail string) error {
 	e := HistoryEvent{
-		Topic:    s.topic,
-		Offset:   off,
-		Sub:      s.name,
-		Event:    event,
-		Consumer: consumer,
-		Epoch:    epoch,
-		Attempt:  attempt,
-		At:       b.now(),
-		Detail:   detail,
+		Topic:     s.topic,
+		Offset:    off,
+		Sub:       s.name,
+		Event:     event,
+		Consumer:  consumer,
+		Epoch:     epoch,
+		Attempt:   attempt,
+		At:        b.now(),
+		Detail:    detail,
+		Partition: b.topics[s.topic][off].Key,
+		GrantID:   grantID,
+	}
+	if g := s.grants[grantID]; g != nil {
+		e.FromConsumer = g.FromConsumer
+		e.ToConsumer = g.ToConsumer
+		e.Reason = g.Reason
+		e.Partitions = append([]string(nil), g.Partitions...)
+		e.StartsAt = g.StartsAt
+		e.ExpiresAt = g.ExpiresAt
 	}
 	b.history = append(b.history, e)
 	return b.appendHistoryLocked(e)
+}
+
+func (b *Broker) recordGrantLifecycleLocked(s *subState, g *PartitionGrant, event, consumer, detail string) error {
+	for _, p := range g.Partitions {
+		e := HistoryEvent{
+			Topic:        s.topic,
+			Offset:       -1,
+			Sub:          s.name,
+			Event:        event,
+			Consumer:     consumer,
+			At:           b.now(),
+			Detail:       detail,
+			Partition:    p,
+			GrantID:      g.ID,
+			Reason:       g.Reason,
+			FromConsumer: g.FromConsumer,
+			ToConsumer:   g.ToConsumer,
+			Partitions:   append([]string(nil), g.Partitions...),
+			StartsAt:     g.StartsAt,
+			ExpiresAt:    g.ExpiresAt,
+		}
+		b.history = append(b.history, e)
+		if err := b.appendHistoryLocked(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Broker) processGrantsLocked(s *subState, now time.Time) (bool, error) {
+	changed := false
+	var grants []*PartitionGrant
+	for _, g := range s.grants {
+		grants = append(grants, g)
+	}
+	sort.Slice(grants, func(i, j int) bool { return grants[i].Seq < grants[j].Seq })
+	for _, g := range grants {
+		switch g.Status {
+		case grantScheduled:
+			if g.StartsAt.After(now) {
+				continue
+			}
+			g.Status = grantActive
+			changed = true
+			if g.Mode == HandoverRevoke {
+				if err := b.revokeInflightLocked(s, g.Partitions, g.ToConsumer, "", g.ID, EventGrantRevoke, g.FromConsumer, now, "old processing authority revoked at grant start"); err != nil {
+					return changed, err
+				}
+			}
+			if err := b.recordGrantLifecycleLocked(s, g, EventGrantStart, g.ToConsumer, "temporary grant started"); err != nil {
+				return changed, err
+			}
+		case grantActive:
+			if g.ExpiresAt.After(now) {
+				continue
+			}
+			g.Status = grantDraining
+			changed = true
+			if err := b.recordGrantLifecycleLocked(s, g, EventGrantReturn, g.FromConsumer, "grant expired; temporary authority returned"); err != nil {
+				return changed, err
+			}
+		}
+		if g.Status == grantDraining {
+			done := true
+			for off, f := range s.inFlight {
+				if f.grantID == g.ID && containsString(g.Partitions, b.topics[s.topic][off].Key) {
+					done = false
+					break
+				}
+			}
+			if done {
+				g.Status = grantCompleted
+				changed = true
+			}
+		}
+	}
+	return changed, nil
+}
+
+func (b *Broker) completeDrainingGrantsLocked(s *subState, partitions []string, now time.Time) error {
+	for _, g := range s.grants {
+		if g.Status != grantDraining || !anyString(g.Partitions, partitions) {
+			continue
+		}
+		done := true
+		for off, f := range s.inFlight {
+			if f.grantID == g.ID && containsString(g.Partitions, b.topics[s.topic][off].Key) {
+				done = false
+				break
+			}
+		}
+		if done {
+			g.Status = grantCompleted
+		}
+	}
+	return nil
+}
+
+func (b *Broker) revokeGrantInflightLocked(s *subState, g *PartitionGrant, now time.Time, event, operator, detail string) error {
+	return b.revokeInflightLocked(s, g.Partitions, "", g.ID, g.ID, event, operator, now, detail)
+}
+
+func (b *Broker) revokeInflightLocked(s *subState, partitions []string, keepOwner, filterGrantID, eventGrantID string, event, operator string, now time.Time, detail string) error {
+	for off, f := range s.inFlight {
+		p := b.topics[s.topic][off].Key
+		if !containsString(partitions, p) {
+			continue
+		}
+		if keepOwner != "" && f.owner == keepOwner {
+			continue
+		}
+		if filterGrantID != "" && f.grantID != filterGrantID {
+			continue
+		}
+		if err := b.recordRevokeLocked(s, off, f, event, operator, eventGrantID, detail); err != nil {
+			return err
+		}
+		delete(s.inFlight, off)
+	}
+	return nil
+}
+
+func (b *Broker) recordRevokeLocked(s *subState, off int64, f *inFlight, event, operator, grantID, detail string) error {
+	e := HistoryEvent{
+		Topic:     s.topic,
+		Offset:    off,
+		Sub:       s.name,
+		Event:     event,
+		Consumer:  operator,
+		Epoch:     f.epoch,
+		Attempt:   s.failures[off] + 1,
+		At:        b.now(),
+		Detail:    detail,
+		Partition: b.topics[s.topic][off].Key,
+		GrantID:   grantID,
+	}
+	if g := s.grants[grantID]; g != nil {
+		e.FromConsumer = g.FromConsumer
+		e.ToConsumer = g.ToConsumer
+		e.Reason = g.Reason
+		e.Partitions = append([]string(nil), g.Partitions...)
+		e.StartsAt = g.StartsAt
+		e.ExpiresAt = g.ExpiresAt
+	}
+	b.history = append(b.history, e)
+	return b.appendHistoryLocked(e)
+}
+
+func (b *Broker) canPullLocked(s *subState, partition, consumer string, now time.Time) bool {
+	for _, g := range s.grants {
+		if !containsString(g.Partitions, partition) {
+			continue
+		}
+		if g.Status == grantActive && !g.StartsAt.After(now) && g.ExpiresAt.After(now) && g.ToConsumer != consumer {
+			return false
+		}
+		if g.Status == grantDraining && g.ToConsumer == consumer {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *Broker) activeGrantIDLocked(s *subState, partition string, now time.Time) string {
+	var active *PartitionGrant
+	for _, g := range s.grants {
+		if g.Status == grantActive && !g.StartsAt.After(now) && g.ExpiresAt.After(now) && containsString(g.Partitions, partition) {
+			if active == nil || g.Seq > active.Seq {
+				active = g
+			}
+		}
+	}
+	if active == nil {
+		return ""
+	}
+	return active.ID
+}
+
+func (b *Broker) hasOverlappingGrantLocked(s *subState, parts []string, start, expire time.Time, exceptID string) bool {
+	for _, g := range s.grants {
+		if g.ID == exceptID || g.Status == grantCompleted || g.Status == grantCanceled {
+			continue
+		}
+		if g.ExpiresAt.After(start) || g.StartsAt.After(expire) || !anyString(g.Partitions, parts) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (b *Broker) grantLocked(s *subState, topic, sub, id string) (*PartitionGrant, error) {
+	g, ok := s.grants[id]
+	if !ok || g.Topic != topic || g.Sub != sub {
+		return nil, ErrGrantNotFound
+	}
+	return g, nil
+}
+
+func (b *Broker) hasDeliveredLocked(topic, sub string, off int64) bool {
+	for _, e := range b.history {
+		if e.Topic == topic && e.Sub == sub && e.Offset == off && e.Event == EventDeliver {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizePartitions(parts []string) ([]string, error) {
+	if len(parts) == 0 {
+		return nil, ErrInvalidGrant
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range parts {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, ErrInvalidGrant
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func cloneGrant(g *PartitionGrant) *PartitionGrant {
+	if g == nil {
+		return nil
+	}
+	c := *g
+	c.Partitions = append([]string(nil), g.Partitions...)
+	return &c
+}
+
+func containsString(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
+func anyString(xs, ys []string) bool {
+	for _, y := range ys {
+		if containsString(xs, y) {
+			return true
+		}
+	}
+	return false
 }
 
 // Position 返回订阅的连续确认位置：从 0 起连续已确认（业务完成）的前缀长度。
