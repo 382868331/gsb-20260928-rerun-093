@@ -27,6 +27,9 @@ type subDisk struct {
 	Abandoned   []int64             `json:"abandoned,omitempty"`
 	MaxFailures int                 `json:"max_failures,omitempty"`
 	BackoffBase time.Duration       `json:"backoff_base,omitempty"`
+	Partitions  int                 `json:"partitions,omitempty"`
+	GrantSeq    uint64              `json:"grant_seq,omitempty"`
+	Grants      []Grant             `json:"grants,omitempty"`
 }
 
 type stateDisk struct {
@@ -98,6 +101,16 @@ func (b *Broker) load() error {
 				abandoned:   map[int64]bool{},
 				maxFailures: s.MaxFailures,
 				backoffBase: s.BackoffBase,
+				partitions:  s.Partitions,
+				grantSeq:    s.GrantSeq,
+				grants:      map[string]*Grant{},
+			}
+			if st.partitions < 1 {
+				st.partitions = 1
+			}
+			for i := range s.Grants {
+				g := s.Grants[i]
+				st.grants[g.ID] = &g
 			}
 			if st.maxFailures < 1 {
 				st.maxFailures = defaultMaxFailures
@@ -234,6 +247,11 @@ func (b *Broker) flushLocked() error {
 			RetryAt:     s.retryAt,
 			MaxFailures: s.maxFailures,
 			BackoffBase: s.backoffBase,
+			Partitions:  s.partitions,
+			GrantSeq:    s.grantSeq,
+		}
+		for _, g := range s.grants {
+			d.Grants = append(d.Grants, *g)
 		}
 		for off := range s.acked {
 			d.Acked = append(d.Acked, off)

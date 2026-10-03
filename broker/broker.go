@@ -110,6 +110,10 @@ type subState struct {
 	abandoned   map[int64]bool      // 放弃集合：人工明确放弃的终态，不等于确认
 	maxFailures int
 	backoffBase time.Duration
+
+	partitions int               // 分区数（默认 1），分区按消息 Key 哈希归属
+	grantSeq   uint64            // 临时授权序号
+	grants     map[string]*Grant // 临时授权（交接）记录，含已关闭
 }
 
 // Counts 是订阅的消息数量核对视图，用于分别核对
@@ -189,6 +193,8 @@ func (b *Broker) CreateSubscription(topic, name string) error {
 		abandoned:   map[int64]bool{},
 		maxFailures: defaultMaxFailures,
 		backoffBase: defaultBackoffBase,
+		partitions:  1,
+		grants:      map[string]*Grant{},
 	}
 	return b.flushLocked()
 }
@@ -296,11 +302,19 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 		if _, held := s.inFlight[off]; held {
 			continue
 		}
+		g := b.activeGrantLocked(s, partitionOf(msgs[off].Key, s.partitions), now)
+		if g != nil && consumerID != g.To {
+			continue // 分区已临时授权他人处理，到期归还前原处理者与其他人都拉不到
+		}
 		s.epochSeq++
 		f := &inFlight{owner: consumerID, epoch: s.epochSeq, deadline: now.Add(visibilityTimeout)}
 		s.inFlight[off] = f
 		attempt := s.failures[off] + 1
-		if err := b.recordHistoryLocked(s, off, EventDeliver, consumerID, f.epoch, attempt, ""); err != nil {
+		detail := ""
+		if g != nil {
+			detail = "grant=" + g.ID + " reason=" + g.Reason
+		}
+		if err := b.recordHistoryLocked(s, off, EventDeliver, consumerID, f.epoch, attempt, detail); err != nil {
 			return nil, err
 		}
 		out = append(out, Delivery{
