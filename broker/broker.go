@@ -111,9 +111,11 @@ type subState struct {
 	maxFailures int
 	backoffBase time.Duration
 
-	partitions int               // 分区数（默认 1），分区按消息 Key 哈希归属
-	grantSeq   uint64            // 临时授权序号
-	grants     map[string]*Grant // 临时授权（交接）记录，含已关闭
+	partitions      int               // 分区数（默认 1），分区按消息 Key 哈希归属
+	grantSeq        uint64            // 临时授权序号
+	grants          map[string]*Grant // 临时授权（交接）记录，含已关闭
+	grantPreviewSeq uint64
+	grantPreviews   map[string]*grantExpiryPreviewState
 }
 
 // Counts 是订阅的消息数量核对视图，用于分别核对
@@ -183,18 +185,19 @@ func (b *Broker) CreateSubscription(topic, name string) error {
 		return ErrSubExists
 	}
 	b.subs[key] = &subState{
-		name:        name,
-		topic:       topic,
-		acked:       map[int64]bool{},
-		inFlight:    map[int64]*inFlight{},
-		failures:    map[int64]int{},
-		retryAt:     map[int64]time.Time{},
-		quarantined: map[int64]bool{},
-		abandoned:   map[int64]bool{},
-		maxFailures: defaultMaxFailures,
-		backoffBase: defaultBackoffBase,
-		partitions:  1,
-		grants:      map[string]*Grant{},
+		name:          name,
+		topic:         topic,
+		acked:         map[int64]bool{},
+		inFlight:      map[int64]*inFlight{},
+		failures:      map[int64]int{},
+		retryAt:       map[int64]time.Time{},
+		quarantined:   map[int64]bool{},
+		abandoned:     map[int64]bool{},
+		maxFailures:   defaultMaxFailures,
+		backoffBase:   defaultBackoffBase,
+		partitions:    1,
+		grants:        map[string]*Grant{},
+		grantPreviews: map[string]*grantExpiryPreviewState{},
 	}
 	return b.flushLocked()
 }
@@ -265,6 +268,10 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 	msgs := b.topics[topic]
 	now := b.now()
 
+	if err := b.enforceGrantExpiriesLocked(s, now); err != nil {
+		return nil, err
+	}
+
 	// 回收超时在途消息：旧 Token 即刻失效（fencing）。
 	reclaimed := false
 	for off, f := range s.inFlight {
@@ -302,7 +309,8 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 		if _, held := s.inFlight[off]; held {
 			continue
 		}
-		g := b.activeGrantLocked(s, partitionOf(msgs[off].Key, s.partitions), now)
+		partition := partitionOf(msgs[off].Key, s.partitions)
+		g := b.activeGrantLocked(s, partition, now)
 		if g != nil && consumerID != g.To {
 			continue // 分区已临时授权他人处理，到期归还前原处理者与其他人都拉不到
 		}
@@ -347,6 +355,9 @@ func (b *Broker) Ack(topic, sub, consumerID, tok string) error {
 	if err != nil {
 		return ErrStaleToken
 	}
+	if err := b.enforceGrantExpiriesLocked(s, b.now()); err != nil {
+		return err
+	}
 	if s.acked[off] {
 		return ErrAlreadyAcked
 	}
@@ -390,6 +401,9 @@ func (b *Broker) Nack(topic, sub, consumerID, tok string) error {
 	off, epoch, err := parseToken(topic, sub, tok)
 	if err != nil {
 		return ErrStaleToken
+	}
+	if err := b.enforceGrantExpiriesLocked(s, b.now()); err != nil {
+		return err
 	}
 	if s.acked[off] {
 		return ErrAlreadyAcked

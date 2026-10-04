@@ -90,26 +90,42 @@ func (b *Broker) load() error {
 		}
 		for _, s := range sd.Subs {
 			st := &subState{
-				name:        s.Name,
-				topic:       s.Topic,
-				acked:       map[int64]bool{},
-				inFlight:    map[int64]*inFlight{},
-				epochSeq:    s.EpochSeq,
-				failures:    map[int64]int{},
-				retryAt:     map[int64]time.Time{},
-				quarantined: map[int64]bool{},
-				abandoned:   map[int64]bool{},
-				maxFailures: s.MaxFailures,
-				backoffBase: s.BackoffBase,
-				partitions:  s.Partitions,
-				grantSeq:    s.GrantSeq,
-				grants:      map[string]*Grant{},
+				name:          s.Name,
+				topic:         s.Topic,
+				acked:         map[int64]bool{},
+				inFlight:      map[int64]*inFlight{},
+				epochSeq:      s.EpochSeq,
+				failures:      map[int64]int{},
+				retryAt:       map[int64]time.Time{},
+				quarantined:   map[int64]bool{},
+				abandoned:     map[int64]bool{},
+				maxFailures:   s.MaxFailures,
+				backoffBase:   s.BackoffBase,
+				partitions:    s.Partitions,
+				grantSeq:      s.GrantSeq,
+				grants:        map[string]*Grant{},
+				grantPreviews: map[string]*grantExpiryPreviewState{},
 			}
 			if st.partitions < 1 {
 				st.partitions = 1
 			}
 			for i := range s.Grants {
 				g := s.Grants[i]
+				if g.Revision == 0 {
+					g.Revision = 1
+				}
+				if len(g.Revisions) == 0 {
+					initialExpiries := map[int]time.Time{}
+					for _, part := range g.Partitions {
+						initialExpiries[part] = g.ExpiresAt
+					}
+					g.Revisions = []GrantRevision{{
+						Revision:    1,
+						At:          g.CreatedAt,
+						Partitions:  append([]int(nil), g.Partitions...),
+						NewExpiries: initialExpiries,
+					}}
+				}
 				st.grants[g.ID] = &g
 			}
 			if st.maxFailures < 1 {

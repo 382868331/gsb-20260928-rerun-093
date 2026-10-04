@@ -395,3 +395,192 @@ func TestGrantCancelAndRestart(t *testing.T) {
 		t.Fatal("cancel fact must survive restart")
 	}
 }
+
+func TestGrantExpiryChangePreviewRevisionAndRestart(t *testing.T) {
+	var now time.Time
+	b, _ := setupGrantBroker(t, &now)
+
+	k0 := keyForPartition(2, 0)
+	k1 := keyForPartition(2, 1)
+	if _, err := b.Publish("orders", k0, []byte("m0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Publish("orders", k1, []byte("m1")); err != nil {
+		t.Fatal(err)
+	}
+	originalExpiry := now.Add(time.Hour)
+	gid, err := b.GrantPartitions("orders", "sub", []int{0, 1}, "c-a", "c-b", "spill", now, originalExpiry, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, err := b.Pull("orders", "sub", "c-b", 10, 2*time.Hour)
+	if err != nil || len(ds) != 2 {
+		t.Fatalf("pull both partitions: %v %d", err, len(ds))
+	}
+	tokens := map[int]string{}
+	for _, d := range ds {
+		tokens[partitionOf(d.Message.Key, 2)] = d.Token
+	}
+
+	shortPreview, err := b.PreviewGrantExpiryChange("orders", "sub", gid, "operator", "shorten p0", []int{0}, now.Add(30*time.Minute), GrantExpiryRevokeProcessing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shortPreview.BaseRevision != 1 || len(shortPreview.Impacts) != 1 {
+		t.Fatalf("short preview = %+v", shortPreview)
+	}
+	impact := shortPreview.Impacts[0]
+	if impact.Partition != 0 || !impact.OldExpiresAt.Equal(originalExpiry) || !impact.NewExpiresAt.Equal(now.Add(30*time.Minute)) || impact.Action != grantExpiryRevoke {
+		t.Fatalf("unexpected impact %+v", impact)
+	}
+	extendPreview, err := b.PreviewGrantExpiryChange("orders", "sub", gid, "operator", "extend all", nil, now.Add(90*time.Minute), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extendPreview.Impacts) != 2 {
+		t.Fatalf("whole grant preview impacts = %+v", extendPreview.Impacts)
+	}
+
+	rev, err := b.ConfirmGrantExpiryChange("orders", "sub", shortPreview.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev.Revision != 2 || len(rev.Partitions) != 1 {
+		t.Fatalf("revision = %+v", rev)
+	}
+	if _, err := b.ConfirmGrantExpiryChange("orders", "sub", extendPreview.ID); !errors.Is(err, ErrGrantExpiryPreviewStale) {
+		t.Fatalf("old revision preview should be rejected, got %v", err)
+	}
+	if _, err := b.ConfirmGrantExpiryChange("orders", "sub", shortPreview.ID); !errors.Is(err, ErrGrantExpiryPreviewStale) {
+		t.Fatalf("reused preview should be rejected, got %v", err)
+	}
+
+	grants, err := b.Grants("orders", "sub")
+	if err != nil || len(grants) != 1 {
+		t.Fatalf("grants: %v %+v", err, grants)
+	}
+	g := grants[0]
+	if g.Revision != 2 || !g.partitionExpiry(0).Equal(now.Add(30*time.Minute)) || !g.partitionExpiry(1).Equal(originalExpiry) {
+		t.Fatalf("partition expiries after change: %+v", g)
+	}
+	if len(g.Revisions) != 2 || len(g.Revisions[1].OldExpiries) != 1 {
+		t.Fatalf("revision history = %+v", g.Revisions)
+	}
+
+	now = now.Add(30 * time.Minute)
+	if err := b.Ack("orders", "sub", "c-b", tokens[0]); !errors.Is(err, ErrStaleToken) {
+		t.Fatalf("shortened revoked processing must not ack, got %v", err)
+	}
+	if err := b.Ack("orders", "sub", "c-b", tokens[1]); err != nil {
+		t.Fatalf("unchanged partition processing should complete, got %v", err)
+	}
+
+	// 未提交预演撤销后，授权期限保持不变。
+	waitPreview, err := b.PreviewGrantExpiryChange("orders", "sub", gid, "operator", "shorten p1", []int{1}, now.Add(40*time.Minute), GrantExpiryWaitCurrentCompletion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CancelGrantExpiryPreview("orders", "sub", waitPreview.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ConfirmGrantExpiryChange("orders", "sub", waitPreview.ID); !errors.Is(err, ErrGrantExpiryPreviewStale) {
+		t.Fatalf("cancelled preview confirm = %v, want stale", err)
+	}
+	grants, _ = b.Grants("orders", "sub")
+	if !grants[0].partitionExpiry(1).Equal(originalExpiry) || grants[0].Revision != 2 {
+		t.Fatalf("cancelling preview changed grant: %+v", grants[0])
+	}
+
+	dir := b.dir
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+	b2.now = func() time.Time { return now }
+	grants, err = b2.Grants("orders", "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants[0].Revisions) != 2 {
+		t.Fatalf("revisions lost after restart: %+v", grants[0].Revisions)
+	}
+	hist, err := b2.History("orders", "sub", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundChange := false
+	for _, e := range hist {
+		if e.Event == EventGrantExpiryChange && strings.Contains(e.Detail, "revision=2") && strings.Contains(e.Detail, "partitions=[0]") {
+			foundChange = true
+		}
+	}
+	if !foundChange {
+		t.Fatalf("expiry change must be traceable after restart: %+v", hist)
+	}
+}
+
+func TestGrantExpiryShortenWaitsForCurrentProcessing(t *testing.T) {
+	var now time.Time
+	b, _ := setupGrantBroker(t, &now)
+	defer b.Close()
+
+	k0 := keyForPartition(2, 0)
+	if _, err := b.Publish("orders", k0, []byte("m0")); err != nil {
+		t.Fatal(err)
+	}
+	gid, err := b.GrantPartitions("orders", "sub", []int{0}, "c-a", "c-b", "spill", now, now.Add(time.Hour), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, err := b.Pull("orders", "sub", "c-b", 1, 2*time.Hour)
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("pull: %v %d", err, len(ds))
+	}
+	p, err := b.PreviewGrantExpiryChange("orders", "sub", gid, "operator", "shorten", nil, now.Add(30*time.Minute), GrantExpiryWaitCurrentCompletion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Impacts[0].Action != grantExpiryWait {
+		t.Fatalf("action = %s", p.Impacts[0].Action)
+	}
+	if _, err := b.ConfirmGrantExpiryChange("orders", "sub", p.ID); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Minute)
+	if err := b.Ack("orders", "sub", "c-b", ds[0].Token); err != nil {
+		t.Fatalf("current processing should be allowed to finish, got %v", err)
+	}
+}
+
+func TestGrantExpiryPreviewRejectsInflightChanges(t *testing.T) {
+	var now time.Time
+	b, _ := setupGrantBroker(t, &now)
+	defer b.Close()
+
+	k0 := keyForPartition(2, 0)
+	if _, err := b.Publish("orders", k0, []byte("m0")); err != nil {
+		t.Fatal(err)
+	}
+	gid, err := b.GrantPartitions("orders", "sub", []int{0}, "c-a", "c-b", "spill", now, now.Add(time.Hour), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, err := b.Pull("orders", "sub", "c-b", 1, time.Hour)
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("pull: %v %d", err, len(ds))
+	}
+	p, err := b.PreviewGrantExpiryChange("orders", "sub", gid, "operator", "shorten", nil, now.Add(30*time.Minute), GrantExpiryRevokeProcessing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Ack("orders", "sub", "c-b", ds[0].Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ConfirmGrantExpiryChange("orders", "sub", p.ID); !errors.Is(err, ErrGrantExpiryPreviewStale) {
+		t.Fatalf("preview after inflight completion should require a fresh preview, got %v", err)
+	}
+}
