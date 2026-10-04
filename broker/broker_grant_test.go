@@ -395,3 +395,194 @@ func TestGrantCancelAndRestart(t *testing.T) {
 		t.Fatal("cancel fact must survive restart")
 	}
 }
+
+func TestGrantExpiryPreviewRevisionAndRestart(t *testing.T) {
+	var now time.Time
+	b, _ := setupGrantBroker(t, &now)
+
+	k0 := keyForPartition(2, 0)
+	k1 := keyForPartition(2, 1)
+	if _, err := b.Publish("orders", k0, []byte("p0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Publish("orders", k1, []byte("p1")); err != nil {
+		t.Fatal(err)
+	}
+	start := now
+	oldExpiry := now.Add(time.Hour)
+	gid, err := b.GrantPartitions("orders", "sub", []int{0, 1}, "c-a", "c-b", "active spillover", start, oldExpiry, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, err := b.Pull("orders", "sub", "c-b", 10, 2*time.Hour)
+	if err != nil || len(ds) != 2 {
+		t.Fatalf("initial pull = %d, %v", len(ds), err)
+	}
+	tokens := map[int]string{}
+	for _, d := range ds {
+		tokens[partitionOf(d.Message.Key, 2)] = d.Token
+	}
+
+	// 整次延长：提交前列出在途消息、原期限、新期限和处理方式。
+	extendedExpiry := oldExpiry.Add(time.Hour)
+	extendPreview, err := b.PrepareGrantExpiryPreview("orders", "sub", gid, nil, extendedExpiry, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extendPreview.Revision != 1 || len(extendPreview.Partitions) != 2 || extendPreview.Shortened {
+		t.Fatalf("bad extend preview: %+v", extendPreview)
+	}
+	if len(extendPreview.InFlight) != 2 {
+		t.Fatalf("extend inflight preview = %+v", extendPreview.InFlight)
+	}
+	for _, item := range extendPreview.InFlight {
+		if !item.OldGrantExpiry.Equal(oldExpiry) || !item.NewGrantExpiry.Equal(extendedExpiry) || item.Action != GrantExpiryKeep {
+			t.Fatalf("bad extend inflight item: %+v", item)
+		}
+	}
+	if err := b.ConfirmGrantExpiry("orders", "sub", extendPreview); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ConfirmGrantExpiry("orders", "sub", extendPreview); !errors.Is(err, ErrGrantRevisionStale) {
+		t.Fatalf("old revision confirmation = %v, want stale", err)
+	}
+
+	// 只缩短分区 0：必须明确等待或撤销，未选分区 1 保持延长后的期限。
+	shortP0Expiry := now.Add(30 * time.Minute)
+	if _, err := b.PrepareGrantExpiryPreview("orders", "sub", gid, []int{0}, shortP0Expiry, ""); !errors.Is(err, ErrGrantExpiryChoice) {
+		t.Fatalf("shorten without explicit choice = %v", err)
+	}
+	waitPreview, err := b.PrepareGrantExpiryPreview("orders", "sub", gid, []int{0}, shortP0Expiry, GrantExpiryWait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waitPreview.Revision != 2 || !waitPreview.Shortened || len(waitPreview.InFlight) != 1 {
+		t.Fatalf("bad wait preview: %+v", waitPreview)
+	}
+	item := waitPreview.InFlight[0]
+	if item.Partition != 0 || item.Action != GrantExpiryWait || !item.OldGrantExpiry.Equal(extendedExpiry) || !item.NewGrantExpiry.Equal(shortP0Expiry) {
+		t.Fatalf("bad shorten preview item: %+v", item)
+	}
+	if err := b.ConfirmGrantExpiry("orders", "sub", waitPreview); err != nil {
+		t.Fatal(err)
+	}
+	now = shortP0Expiry
+	if err := b.Ack("orders", "sub", "c-b", tokens[0]); err != nil {
+		t.Fatalf("waiting policy must preserve current in-flight processing: %v", err)
+	}
+	if _, err := b.Pull("orders", "sub", "c-b", 10, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	// 分区 1 再缩短并撤销当前处理权：旧 Token 立即失效，但不视为成功。
+	shortP1Expiry := now.Add(30 * time.Minute)
+	revokePreview, err := b.PrepareGrantExpiryPreview("orders", "sub", gid, []int{1}, shortP1Expiry, GrantExpiryRevoke)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revokePreview.InFlight) != 1 || revokePreview.InFlight[0].Action != GrantExpiryRevoke {
+		t.Fatalf("bad revoke preview: %+v", revokePreview.InFlight)
+	}
+	if err := b.ConfirmGrantExpiry("orders", "sub", revokePreview); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Ack("orders", "sub", "c-b", tokens[1]); !errors.Is(err, ErrStaleToken) {
+		t.Fatalf("revoked in-flight ack = %v, want stale", err)
+	}
+	now = shortP1Expiry
+	ds, err = b.Pull("orders", "sub", "c-a", 10, time.Hour)
+	if err != nil || len(ds) != 1 || partitionOf(ds[0].Message.Key, 2) != 1 {
+		t.Fatalf("after shortened expiry original owner should receive p1: %+v %v", ds, err)
+	}
+	if err := b.Ack("orders", "sub", "c-a", ds[0].Token); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := b.Counts("orders", "sub")
+	if err != nil || counts.Acked != 2 {
+		t.Fatalf("counts = %+v, %v", counts, err)
+	}
+
+	// 保存重开后可追溯每次修订、实际影响分区与各分区当前期限。
+	dir := b.dir
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+	b2.now = func() time.Time { return now }
+	grants, err := b2.Grants("orders", "sub")
+	if err != nil || len(grants) != 1 {
+		t.Fatalf("grants after restart = %+v, %v", grants, err)
+	}
+	g := grants[0]
+	if g.Revision != 4 || len(g.Revisions) != 3 || len(g.Terms) != 2 {
+		t.Fatalf("revision history after restart = %+v", g)
+	}
+	terms := map[int]time.Time{}
+	for _, term := range g.Terms {
+		terms[term.Partition] = term.ExpiresAt
+	}
+	if !terms[0].Equal(shortP0Expiry) || !terms[1].Equal(shortP1Expiry) {
+		t.Fatalf("actual partition expiry scope = %+v", terms)
+	}
+	if len(g.Revisions[0].Partitions) != 2 || len(g.Revisions[1].Partitions) != 1 || g.Revisions[1].Partitions[0] != 0 || g.Revisions[2].Partitions[0] != 1 {
+		t.Fatalf("revision scopes = %+v", g.Revisions)
+	}
+	hist, err := b2.History("orders", "sub", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expiryEvents int
+	for _, e := range hist {
+		if e.Event == EventGrantExpiry && strings.Contains(e.Detail, "grant="+gid) {
+			expiryEvents++
+		}
+	}
+	if expiryEvents != 3 {
+		t.Fatalf("grant expiry history events = %d, want 3", expiryEvents)
+	}
+}
+
+func TestGrantExpiryShortenToNowRevokesWithoutSuccess(t *testing.T) {
+	var now time.Time
+	b, _ := setupGrantBroker(t, &now)
+	defer b.Close()
+
+	k0 := keyForPartition(2, 0)
+	if _, err := b.Publish("orders", k0, []byte("p0")); err != nil {
+		t.Fatal(err)
+	}
+	gid, err := b.GrantPartitions("orders", "sub", []int{0}, "c-a", "c-b", "active", now, now.Add(time.Hour), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, err := b.Pull("orders", "sub", "c-b", 1, time.Hour)
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("pull = %+v, %v", ds, err)
+	}
+	tok := ds[0].Token
+	preview, err := b.PrepareGrantExpiryPreview("orders", "sub", gid, nil, now, GrantExpiryRevoke)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.InFlight) != 1 || preview.InFlight[0].Action != GrantExpiryRevoke {
+		t.Fatalf("preview = %+v", preview.InFlight)
+	}
+	if err := b.ConfirmGrantExpiry("orders", "sub", preview); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Ack("orders", "sub", "c-b", tok); !errors.Is(err, ErrStaleToken) {
+		t.Fatalf("revoked ack = %v, want stale", err)
+	}
+	counts, err := b.Counts("orders", "sub")
+	if err != nil || counts.Acked != 0 {
+		t.Fatalf("revoked work must not count as success: %+v %v", counts, err)
+	}
+	ds, err = b.Pull("orders", "sub", "c-a", 1, time.Hour)
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("original owner redelivery = %+v, %v", ds, err)
+	}
+}

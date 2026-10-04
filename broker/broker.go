@@ -302,7 +302,8 @@ func (b *Broker) Pull(topic, sub, consumerID string, max int, visibilityTimeout 
 		if _, held := s.inFlight[off]; held {
 			continue
 		}
-		g := b.activeGrantLocked(s, partitionOf(msgs[off].Key, s.partitions), now)
+		p := partitionOf(msgs[off].Key, s.partitions)
+		g := b.activeGrantLocked(s, p, now)
 		if g != nil && consumerID != g.To {
 			continue // 分区已临时授权他人处理，到期归还前原处理者与其他人都拉不到
 		}

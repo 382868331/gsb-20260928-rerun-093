@@ -110,6 +110,12 @@ func (b *Broker) load() error {
 			}
 			for i := range s.Grants {
 				g := s.Grants[i]
+				if g.Revision < 1 {
+					g.Revision = 1
+				}
+				if len(g.Terms) == 0 {
+					g.Terms = initialGrantTerms(g.Partitions, g.ExpiresAt)
+				}
 				st.grants[g.ID] = &g
 			}
 			if st.maxFailures < 1 {

@@ -14,40 +14,121 @@ const (
 	EventGrant       = "grant"        // 建立临时授权（交接）
 	EventGrantCancel = "grant_cancel" // 取消尚未开始的临时授权
 	EventGrantReturn = "grant_return" // 授权到期归还
+	EventGrantExpiry = "grant_expiry" // 临时授权期限修订
 	EventRevoke      = "revoke"       // 在途处理权被撤回（交接或归还时立即终止）
 )
 
 var (
-	ErrNoGrant          = errors.New("broker: no such grant")
-	ErrGrantConflict    = errors.New("broker: partition already covered by an overlapping grant")
-	ErrGrantStarted     = errors.New("broker: grant already started, cannot cancel")
-	ErrGrantClosed      = errors.New("broker: grant already cancelled or returned")
-	ErrInvalidPartition = errors.New("broker: invalid partition")
+	ErrNoGrant            = errors.New("broker: no such grant")
+	ErrGrantConflict      = errors.New("broker: partition already covered by an overlapping grant")
+	ErrGrantStarted       = errors.New("broker: grant already started, cannot cancel")
+	ErrGrantClosed        = errors.New("broker: grant already cancelled or returned")
+	ErrInvalidPartition   = errors.New("broker: invalid partition")
+	ErrGrantRevisionStale = errors.New("broker: grant revision is stale; review the latest expiry preview")
+	ErrGrantExpiryChoice  = errors.New("broker: shortening a grant requires wait or revoke for current processing")
+	ErrGrantExpirySame    = errors.New("broker: grant expiry is unchanged for selected partitions")
+)
+
+const (
+	GrantExpiryWait   = "wait"   // 缩短后等待已有在途处理自然完成或超时
+	GrantExpiryRevoke = "revoke" // 缩短时撤销受托者当前在途处理权
+	GrantExpiryKeep   = "keep"   // 不撤销在途处理（延长或无需变动时）
 )
 
 // Grant 是一次临时授权：把指定分区在 [StartsAt, ExpiresAt) 内
 // 从原处理者 From 临时交给 To 处理，到期归还，不永久改变归属。
 // 授权范围、期限与交接原因随消息历史保留。
 type Grant struct {
-	ID         string    `json:"id"`
-	Topic      string    `json:"topic"`
-	Sub        string    `json:"sub"`
-	Partitions []int     `json:"partitions"`
-	From       string    `json:"from"`
-	To         string    `json:"to"`
-	Reason     string    `json:"reason"`
-	StartsAt   time.Time `json:"starts_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	CreatedAt  time.Time `json:"created_at"`
-	Cancelled  bool      `json:"cancelled,omitempty"`
-	Returned   bool      `json:"returned,omitempty"`
-	ReturnedAt time.Time `json:"returned_at,omitempty"`
-	Terminated bool      `json:"terminated,omitempty"` // 归还时立即终止在途处理
+	ID         string          `json:"id"`
+	Topic      string          `json:"topic"`
+	Sub        string          `json:"sub"`
+	Partitions []int           `json:"partitions"`
+	From       string          `json:"from"`
+	To         string          `json:"to"`
+	Reason     string          `json:"reason"`
+	StartsAt   time.Time       `json:"starts_at"`
+	ExpiresAt  time.Time       `json:"expires_at"`
+	CreatedAt  time.Time       `json:"created_at"`
+	Revision   int             `json:"revision,omitempty"`
+	Terms      []GrantTerm     `json:"terms,omitempty"`
+	Revisions  []GrantRevision `json:"revisions,omitempty"`
+	Cancelled  bool            `json:"cancelled,omitempty"`
+	Returned   bool            `json:"returned,omitempty"`
+	ReturnedAt time.Time       `json:"returned_at,omitempty"`
+	Terminated bool            `json:"terminated,omitempty"` // 归还时立即终止在途处理
+}
+
+// GrantTerm 是单个分区当前实际生效的授权期限。
+type GrantTerm struct {
+	Partition int       `json:"partition"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// GrantRevision 记录一次授权期限修订及其实际影响分区。
+type GrantRevision struct {
+	Revision        int               `json:"revision"`
+	At              time.Time         `json:"at"`
+	Partitions      []int             `json:"partitions"`
+	Changes         []GrantTermChange `json:"changes,omitempty"`
+	NewExpiresAt    time.Time         `json:"new_expires_at"`
+	ShortenedPolicy string            `json:"shortened_policy,omitempty"`
+}
+
+// GrantTermChange 记录单个分区在一次期限修订前后的实际期限。
+type GrantTermChange struct {
+	Partition int       `json:"partition"`
+	OldExpiry time.Time `json:"old_expires_at"`
+	NewExpiry time.Time `json:"new_expires_at"`
+}
+
+// GrantExpiryInFlight 是期限变更预演中的一条受影响在途消息。
+type GrantExpiryInFlight struct {
+	Offset           int64     `json:"offset"`
+	Owner            string    `json:"owner"`
+	Epoch            uint64    `json:"epoch"`
+	Partition        int       `json:"partition"`
+	OldGrantExpiry   time.Time `json:"old_grant_expiry"`
+	NewGrantExpiry   time.Time `json:"new_grant_expiry"`
+	DeliveryDeadline time.Time `json:"delivery_deadline"`
+	Action           string    `json:"action"`
+}
+
+// GrantExpiryPreview 是提交前的期限变更预演。它不会落盘；
+// Revision 是预演所依据的授权修订，确认时必须仍为最新修订。
+type GrantExpiryPreview struct {
+	GrantID         string                `json:"grant_id"`
+	Revision        int                   `json:"revision"`
+	Partitions      []int                 `json:"partitions"`
+	NewExpiresAt    time.Time             `json:"new_expires_at"`
+	ShortenedPolicy string                `json:"shortened_policy,omitempty"`
+	Shortened       bool                  `json:"shortened"`
+	InFlight        []GrantExpiryInFlight `json:"in_flight"`
 }
 
 // active 判断授权在 t 时刻是否有效（已生效、未到期、未取消、未归还）。
 func (g *Grant) active(t time.Time) bool {
-	return !g.Cancelled && !g.Returned && !g.StartsAt.After(t) && t.Before(g.ExpiresAt)
+	if g.Cancelled || g.Returned || g.StartsAt.After(t) {
+		return false
+	}
+	for _, term := range g.Terms {
+		if t.Before(term.ExpiresAt) {
+			return true
+		}
+	}
+	return len(g.Terms) == 0 && t.Before(g.ExpiresAt)
+}
+
+func (g *Grant) partitionActive(partition int, t time.Time) bool {
+	return g.active(t) && g.covers(partition) && t.Before(g.effectiveExpiry(partition))
+}
+
+func (g *Grant) effectiveExpiry(partition int) time.Time {
+	for _, term := range g.Terms {
+		if term.Partition == partition {
+			return term.ExpiresAt
+		}
+	}
+	return g.ExpiresAt
 }
 
 func (g *Grant) covers(partition int) bool {
@@ -204,11 +285,8 @@ func (b *Broker) GrantPartitions(topic, sub string, partitions []int, from, to, 
 		if g.Cancelled || g.Returned {
 			continue
 		}
-		if !g.StartsAt.Before(expiry) || !start.Before(g.ExpiresAt) {
-			continue
-		}
 		for _, p := range parts {
-			if g.covers(p) {
+			if g.covers(p) && g.StartsAt.Before(expiry) && start.Before(g.effectiveExpiry(p)) {
 				return "", ErrGrantConflict
 			}
 		}
@@ -225,6 +303,8 @@ func (b *Broker) GrantPartitions(topic, sub string, partitions []int, from, to, 
 		StartsAt:   start,
 		ExpiresAt:  expiry,
 		CreatedAt:  b.now(),
+		Revision:   1,
+		Terms:      initialGrantTerms(parts, expiry),
 	}
 	s.grants[g.ID] = g
 	if err := b.recordHistoryLocked(s, -1, EventGrant, to, 0, 0, grantDetail(g)); err != nil {
@@ -237,6 +317,250 @@ func (b *Broker) GrantPartitions(topic, sub string, partitions []int, from, to, 
 		}
 	}
 	return g.ID, b.flushLocked()
+}
+
+func initialGrantTerms(parts []int, expiry time.Time) []GrantTerm {
+	terms := make([]GrantTerm, 0, len(parts))
+	for _, p := range parts {
+		terms = append(terms, GrantTerm{Partition: p, ExpiresAt: expiry})
+	}
+	return terms
+}
+
+// PrepareGrantExpiryPreview 预演一次已生效临时授权的期限变更。
+// partitions 为空表示调整整次授权的所有分区；未选择分区保留原期限。
+// 缩短任何分区时，shortenedPolicy 必须显式选择 wait 或 revoke。
+func (b *Broker) PrepareGrantExpiryPreview(topic, sub, grantID string, partitions []int, newExpiry time.Time, shortenedPolicy string) (GrantExpiryPreview, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, g, err := b.grantForExpiryChangeLocked(topic, sub, grantID)
+	if err != nil {
+		return GrantExpiryPreview{}, err
+	}
+	selected, err := b.selectedGrantPartitionsLocked(s, g, partitions)
+	if err != nil {
+		return GrantExpiryPreview{}, err
+	}
+	now := b.now()
+	if newExpiry.Before(now) || newExpiry.Before(g.StartsAt) {
+		return GrantExpiryPreview{}, ErrInvalidPartition
+	}
+	shortened := false
+	for _, p := range selected {
+		if !g.effectiveExpiry(p).After(now) {
+			return GrantExpiryPreview{}, ErrInvalidPartition
+		}
+		if newExpiry.Before(g.effectiveExpiry(p)) {
+			shortened = true
+		}
+	}
+	if shortened {
+		switch shortenedPolicy {
+		case GrantExpiryWait, GrantExpiryRevoke:
+		default:
+			return GrantExpiryPreview{}, ErrGrantExpiryChoice
+		}
+	} else {
+		shortenedPolicy = GrantExpiryKeep
+	}
+	action := GrantExpiryWait
+	if !shortened {
+		action = GrantExpiryKeep
+	} else if shortenedPolicy == GrantExpiryRevoke {
+		action = GrantExpiryRevoke
+	}
+	preview := GrantExpiryPreview{
+		GrantID:         g.ID,
+		Revision:        g.Revision,
+		Partitions:      append([]int(nil), selected...),
+		NewExpiresAt:    newExpiry,
+		ShortenedPolicy: shortenedPolicy,
+		Shortened:       shortened,
+	}
+	selectedSet := map[int]bool{}
+	changes := make([]GrantTermChange, 0, len(selected))
+	shortenedPartitions := map[int]bool{}
+	for _, p := range selected {
+		selectedSet[p] = true
+		old := g.effectiveExpiry(p)
+		changes = append(changes, GrantTermChange{Partition: p, OldExpiry: old, NewExpiry: preview.NewExpiresAt})
+		if preview.NewExpiresAt.Before(old) {
+			shortenedPartitions[p] = true
+		}
+	}
+	msgs := b.topics[s.topic]
+	for off, f := range s.inFlight {
+		p := partitionOf(msgs[off].Key, s.partitions)
+		if !selectedSet[p] {
+			continue
+		}
+		oldExpiry := g.effectiveExpiry(p)
+		if !shortened {
+			action = GrantExpiryKeep
+		} else if f.owner != g.To || !newExpiry.Before(oldExpiry) {
+			action = GrantExpiryWait
+		} else {
+			action = shortenedPolicy
+		}
+		preview.InFlight = append(preview.InFlight, GrantExpiryInFlight{
+			Offset:           off,
+			Owner:            f.owner,
+			Epoch:            f.epoch,
+			Partition:        p,
+			OldGrantExpiry:   oldExpiry,
+			NewGrantExpiry:   newExpiry,
+			DeliveryDeadline: f.deadline,
+			Action:           action,
+		})
+	}
+	sort.Slice(preview.InFlight, func(i, j int) bool { return preview.InFlight[i].Offset < preview.InFlight[j].Offset })
+	return preview, nil
+}
+
+// ConfirmGrantExpiry 按预演提交期限变更。每次确认产生新的授权修订；
+// 基于旧修订的确认会被拒绝，需要重新调用 PrepareGrantExpiryPreview。
+func (b *Broker) ConfirmGrantExpiry(topic, sub string, preview GrantExpiryPreview) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, g, err := b.grantForExpiryChangeLocked(topic, sub, preview.GrantID)
+	if err != nil {
+		return err
+	}
+	if preview.Revision != g.Revision {
+		return ErrGrantRevisionStale
+	}
+	selected, err := b.selectedGrantPartitionsLocked(s, g, preview.Partitions)
+	if err != nil {
+		return err
+	}
+	now := b.now()
+	if preview.NewExpiresAt.Before(now) || preview.NewExpiresAt.Before(g.StartsAt) {
+		return ErrInvalidPartition
+	}
+	shortened := false
+	unchanged := true
+	for _, p := range selected {
+		old := g.effectiveExpiry(p)
+		if !old.After(now) {
+			return ErrInvalidPartition
+		}
+		if preview.NewExpiresAt.Before(old) {
+			shortened = true
+		}
+		if !preview.NewExpiresAt.Equal(old) {
+			unchanged = false
+		}
+	}
+	if unchanged {
+		return ErrGrantExpirySame
+	}
+	if shortened {
+		switch preview.ShortenedPolicy {
+		case GrantExpiryWait, GrantExpiryRevoke:
+		default:
+			return ErrGrantExpiryChoice
+		}
+	}
+	selectedSet := map[int]bool{}
+	changes := make([]GrantTermChange, 0, len(selected))
+	shortenedPartitions := map[int]bool{}
+	for _, p := range selected {
+		selectedSet[p] = true
+		old := g.effectiveExpiry(p)
+		changes = append(changes, GrantTermChange{Partition: p, OldExpiry: old, NewExpiry: preview.NewExpiresAt})
+		if preview.NewExpiresAt.Before(old) {
+			shortenedPartitions[p] = true
+		}
+	}
+	for _, other := range s.grants {
+		if other == g || other.Cancelled || other.Returned {
+			continue
+		}
+		for _, p := range selected {
+			if other.covers(p) && other.StartsAt.Before(preview.NewExpiresAt) && g.StartsAt.Before(other.effectiveExpiry(p)) {
+				return ErrGrantConflict
+			}
+		}
+	}
+	for i := range g.Terms {
+		if selectedSet[g.Terms[i].Partition] {
+			g.Terms[i].ExpiresAt = preview.NewExpiresAt
+		}
+	}
+	latest := latestExpiry(g.Terms)
+	if latest.After(g.ExpiresAt) {
+		g.ExpiresAt = latest
+	}
+	g.Revision++
+	rev := GrantRevision{
+		Revision:        g.Revision,
+		At:              now,
+		Partitions:      append([]int(nil), selected...),
+		Changes:         changes,
+		NewExpiresAt:    preview.NewExpiresAt,
+		ShortenedPolicy: preview.ShortenedPolicy,
+	}
+	g.Revisions = append(g.Revisions, rev)
+	detail := grantExpiryDetail(g, rev, shortened)
+	if err := b.recordHistoryLocked(s, -1, EventGrantExpiry, g.To, 0, 0, detail); err != nil {
+		return err
+	}
+	if shortened && preview.ShortenedPolicy == GrantExpiryRevoke {
+		revoke := *g
+		revoke.Partitions = revoke.Partitions[:0]
+		for p := range shortenedPartitions {
+			revoke.Partitions = append(revoke.Partitions, p)
+		}
+		sort.Ints(revoke.Partitions)
+		if err := b.revokeInFlightLocked(s, &revoke, "", "grant "+g.ID+" expiry revision "+fmt.Sprint(g.Revision)+" revoke"); err != nil {
+			return err
+		}
+	}
+	return b.flushLocked()
+}
+
+func (b *Broker) grantForExpiryChangeLocked(topic, sub, grantID string) (*subState, *Grant, error) {
+	s, err := b.subLocked(topic, sub)
+	if err != nil {
+		return nil, nil, err
+	}
+	g, ok := s.grants[grantID]
+	if !ok {
+		return nil, nil, ErrNoGrant
+	}
+	now := b.now()
+	if g.Cancelled || g.Returned {
+		return nil, nil, ErrGrantClosed
+	}
+	if g.StartsAt.After(now) || !g.active(now) {
+		return nil, nil, ErrGrantStarted
+	}
+	return s, g, nil
+}
+
+func (b *Broker) selectedGrantPartitionsLocked(s *subState, g *Grant, partitions []int) ([]int, error) {
+	if len(partitions) == 0 {
+		return append([]int(nil), g.Partitions...), nil
+	}
+	parts := append([]int(nil), partitions...)
+	sort.Ints(parts)
+	parts = dedupeInts(parts)
+	for _, p := range parts {
+		if p < 0 || p >= s.partitions || !g.covers(p) {
+			return nil, ErrInvalidPartition
+		}
+	}
+	return parts, nil
+}
+
+func latestExpiry(terms []GrantTerm) time.Time {
+	var latest time.Time
+	for _, term := range terms {
+		if latest.IsZero() || term.ExpiresAt.After(latest) {
+			latest = term.ExpiresAt
+		}
+	}
+	return latest
 }
 
 // revokeInFlightLocked 回收授权分区上不属于 keepOwner 的在途处理，
@@ -340,7 +664,7 @@ func (b *Broker) Grants(topic, sub string) ([]Grant, error) {
 func (b *Broker) activeGrantLocked(s *subState, partition int, now time.Time) *Grant {
 	var best *Grant
 	for _, g := range s.grants {
-		if !g.active(now) || !g.covers(partition) {
+		if !g.partitionActive(partition, now) {
 			continue
 		}
 		if best == nil || g.ID < best.ID {
@@ -358,6 +682,30 @@ func grantDetail(g *Grant) string {
 	return fmt.Sprintf("partitions=[%s] from=%s to=%s reason=%s start=%s expiry=%s",
 		strings.Join(parts, ","), g.From, g.To, g.Reason,
 		g.StartsAt.Format(time.RFC3339Nano), g.ExpiresAt.Format(time.RFC3339Nano))
+}
+
+func grantExpiryDetail(g *Grant, rev GrantRevision, shortened bool) string {
+	parts := make([]string, len(rev.Partitions))
+	for i, p := range rev.Partitions {
+		parts[i] = fmt.Sprint(p)
+	}
+	direction := "extend"
+	if shortened {
+		direction = "shorten"
+	}
+	policy := rev.ShortenedPolicy
+	if policy == "" {
+		policy = GrantExpiryKeep
+	}
+	old := make([]string, 0, len(rev.Changes))
+	newParts := make([]string, 0, len(rev.Changes))
+	for _, change := range rev.Changes {
+		old = append(old, fmt.Sprintf("%d:%s", change.Partition, change.OldExpiry.Format(time.RFC3339Nano)))
+		newParts = append(newParts, fmt.Sprintf("%d:%s", change.Partition, change.NewExpiry.Format(time.RFC3339Nano)))
+	}
+	return fmt.Sprintf("grant=%s revision=%d partitions=[%s] direction=%s old_partition_expiry=[%s] new_partition_expiry=[%s] policy=%s",
+		g.ID, rev.Revision, strings.Join(parts, ","), direction,
+		strings.Join(old, ","), strings.Join(newParts, ","), policy)
 }
 
 func dedupeInts(in []int) []int {
